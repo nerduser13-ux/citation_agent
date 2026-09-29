@@ -1,0 +1,1185 @@
+From 162c56f1bbee753f50e4ef6f7cd04505b0e689f5 Mon Sep 17 00:00:00 2001
+From: nerduser13-ux <288021437+nerduser13-ux@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 18:25:25 +0000
+Subject: [PATCH] Recognize Word auto-numbered reference lists; add --inspect;
+ safe splitting of runs with page-break render hints
+
+Fixes the real-world case (RALF document) where the References heading was
+found but 0 entries were parsed because the reference list is Word
+auto-numbered (w:numPr via the 'List Number' style; numbers not in text).
+
+- document_reader: load_numbering_map() (word/numbering.xml: numId ->
+  abstractNum -> lvl start/numFmt), paragraph_numpr_info() (direct pPr or
+  style chain incl. basedOn), compute_list_numbers() (visible number per
+  paragraph, decimal lists only, document-wide sequence as Word renders).
+- reference_parser: entries may be typed numbers OR Word list numbers (typed
+  wins when both present); block detection counts auto-numbered paragraphs.
+- word_footnotes: runs containing w:lastRenderedPageBreak (zero-width
+  render hint) are now safe to split; the replacement preserves original w:t
+  segmentation and places render hints at their original text positions.
+- main: --inspect read-only diagnostic (per-line: idx/number/typed-or-list/
+  URLs/text + resulting number->URL map + likely-cause hints).
+- tests: +5 (auto-numbered list, bullet list NOT entries, typed-beats-list,
+  page-break hint single + multiple citations) - 44/44 pass.
+- Verified on the user's RALF document: 5 references, 7/7 footnotes
+  inserted, 0 unresolved, 0 ambiguous, validation PASS, input hash
+  unchanged.
+- README: documents auto-numbered list support + --inspect.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ README.md                                     |   9 +-
+ agent_tools.py                                |  12 +-
+ document_reader.py                            | 131 ++++++++++++++++++
+ input/sample.docx                             | Bin 37740 -> 37740 bytes
+ main.py                                       |  98 ++++++++++++-
+ ...nal Competency Account_with_footnotes.docx | Bin 0 -> 18001 bytes
+ output/citation_review_report.csv             |  40 +++---
+ reference_parser.py                           |  41 ++++--
+ tests/test_pipeline.py                        | 125 +++++++++++++++++
+ word_footnotes.py                             | 111 +++++++++++----
+ 10 files changed, 497 insertions(+), 70 deletions(-)
+ create mode 100644 output/RALF Reflective Professional Competency Account_with_footnotes.docx
+
+diff --git a/README.md b/README.md
+index 872dd18..f790142 100644
+--- a/README.md
++++ b/README.md
+@@ -160,7 +160,14 @@ were collected …") is **not** treated as a heading.
+ 
+ ### Reference parsing rules
+ 
+-* Entry lines look like `1. …`, `1) …`, `1 …` or `[1] …`.
++* Entry lines look like `1. …`, `1) …` or `[1] …`.
++* **Word auto-numbered lists work too**: if the reference entries are a Word
++  numbered list (the numbers are rendered by the numbering engine —
++  `w:numPr`, directly on the paragraph or via styles like *List Number* —
++  and are not typed into the text), the visible number is resolved from
++  `word/numbering.xml` and used as the entry number. Typed numbers always
++  win over list numbers when both are present. Bulleted / lettered / roman
++  lists are not treated as numbered entries (nothing is invented).
+ * A line starting with a year (`2020. …`) is **not** a numbered entry; it ends
+   the current entry (its URLs must not be attributed to a reference number).
+ * Wrapped continuation lines are appended to the current entry.
+diff --git a/agent_tools.py b/agent_tools.py
+index 74aee63..c9bbce1 100644
+--- a/agent_tools.py
++++ b/agent_tools.py
+@@ -37,15 +37,17 @@ def inspect_document(path):
+     }
+ 
+ 
+-def find_reference_section(paragraphs, config):
++def find_reference_section(paragraphs, config, list_numbers=None):
+     """Locate the reference section. Returns (start_index, method, confidence,
+-    note) or None (-> caller must abort, no guessing)."""
+-    return ReferenceParser(config).find_reference_section(paragraphs, config)
++    note) or None (-> caller must abort, no guessing). ``list_numbers`` maps
++    paragraph index -> visible number of Word auto-numbered paragraphs."""
++    return ReferenceParser(config).find_reference_section(
++        paragraphs, config, list_numbers)
+ 
+ 
+-def extract_references(paragraphs, start_index):
++def extract_references(paragraphs, start_index, list_numbers=None):
+     """Extract the number -> {url, text} map from the reference list."""
+-    return ReferenceParser().parse_references(paragraphs, start_index)
++    return ReferenceParser().parse_references(paragraphs, start_index, list_numbers)
+ 
+ 
+ def find_citations(paragraphs, ref_section_start):
+diff --git a/document_reader.py b/document_reader.py
+index af855a1..8412714 100644
+--- a/document_reader.py
++++ b/document_reader.py
+@@ -153,6 +153,128 @@ def is_heading(paragraph) -> bool:
+     return False
+ 
+ 
++# --------------------------------------------------------------------------
++# Word automatic list numbering (w:numPr / numbering.xml)
++# --------------------------------------------------------------------------
++def load_numbering_map(doc) -> dict:
++    """Parse word/numbering.xml into {numId: {ilvl: (start, numFmt)}}.
++
++    Empty dict when the document has no numbering part."""
++    from lxml import etree
++    part = None
++    for p in doc.part.package.iter_parts():
++        if str(p.partname).endswith("numbering.xml"):
++            part = p
++            break
++    if part is None:
++        return {}
++    root = etree.fromstring(part.blob)
++    abstract = {}
++    for an in root.findall(qn("w:abstractNum")):
++        aid = an.get(qn("w:abstractNumId"))
++        lvls = {}
++        for lvl in an.findall(qn("w:lvl")):
++            ilvl = lvl.get(qn("w:ilvl")) or "0"
++            start_el = lvl.find(qn("w:start"))
++            fmt_el = lvl.find(qn("w:numFmt"))
++            try:
++                start = int(start_el.get(qn("w:val"))) if start_el is not None else 1
++            except (TypeError, ValueError):
++                start = 1
++            fmt = fmt_el.get(qn("w:val")) if fmt_el is not None else "decimal"
++            lvls[ilvl] = (start, fmt)
++        abstract[aid] = lvls
++    out = {}
++    for num in root.findall(qn("w:num")):
++        num_id = num.get(qn("w:numId"))
++        aid_el = num.find(qn("w:abstractNumId"))
++        if num_id is None or aid_el is None:
++            continue
++        aid = aid_el.get(qn("w:val"))
++        if aid in abstract:
++            out[num_id] = abstract[aid]
++    return out
++
++
++def _style_chain_numpr(doc, style_id, _seen=None):
++    """numPr element from the style definition (following basedOn), or None."""
++    if _seen is None:
++        _seen = set()
++    if not style_id or style_id in _seen:
++        return None
++    _seen.add(style_id)
++    style = None
++    for s in doc.styles.element.findall(qn("w:style")):
++        if s.get(qn("w:styleId")) == style_id:
++            style = s
++            break
++    if style is None:
++        return None
++    pPr = style.find(qn("w:pPr"))
++    if pPr is not None:
++        numPr = pPr.find(qn("w:numPr"))
++        if numPr is not None:
++            return numPr
++    based = style.find(qn("w:basedOn"))
++    if based is not None:
++        return _style_chain_numpr(doc, based.get(qn("w:val")), _seen)
++    return None
++
++
++def paragraph_numpr_info(p_elem, doc, numbering_map):
++    """Visible-number info for a paragraph, or None.
++
++    Returns (numId, ilvl, start_value). The numbering is taken from the
++    paragraph's own <w:numPr> or, failing that, from its paragraph style
++    chain (this is how "List Number" styled paragraphs are numbered). Only
++    decimal numbering qualifies (bullets/letters/romans are not reference
++    numbers)."""
++    if not numbering_map:
++        return None
++    numPr = None
++    pPr = p_elem.find(qn("w:pPr"))
++    if pPr is not None:
++        numPr = pPr.find(qn("w:numPr"))
++        if numPr is None:
++            pstyle = pPr.find(qn("w:pStyle"))
++            if pstyle is not None:
++                numPr = _style_chain_numpr(doc, pstyle.get(qn("w:val")))
++    if numPr is None:
++        return None
++    numId_el = numPr.find(qn("w:numId"))
++    ilvl_el = numPr.find(qn("w:ilvl"))
++    if numId_el is None:
++        return None
++    num_id = numId_el.get(qn("w:val"))
++    if num_id in (None, "0"):
++        return None
++    ilvl = (ilvl_el.get(qn("w:val")) if ilvl_el is not None else "0") or "0"
++    lvls = numbering_map.get(num_id)
++    if not lvls:
++        return None
++    start, fmt = lvls.get(ilvl, (1, "decimal"))
++    if fmt != "decimal":
++        return None
++    return num_id, ilvl, start
++
++
++def compute_list_numbers(paragraphs, doc, numbering_map) -> dict:
++    """Map paragraph index -> visible automatic number (document-wide
++    sequence per list, as rendered by Word). Only decimal lists."""
++    seq = {}
++    out = {}
++    for i, p in enumerate(paragraphs):
++        info = paragraph_numpr_info(p._p, doc, numbering_map)
++        if info is None:
++            continue
++        num_id, ilvl, start = info
++        key = (num_id, ilvl)
++        n = seq.get(key, start)
++        seq[key] = n + 1
++        out[i] = n
++    return out
++
++
+ # --------------------------------------------------------------------------
+ # Existing-footnote snapshot (input-side, pre-edit)
+ # --------------------------------------------------------------------------
+@@ -212,6 +334,15 @@ class DocumentReader:
+         """raw_text_of() for every paragraph, in all_paragraphs() order."""
+         return [raw_text_of(p._p) for p in self.all_paragraphs()]
+ 
++    def list_numbers(self) -> dict:
++        """{paragraph_index: visible automatic number} for paragraphs that
++        belong to a Word decimal numbered list (direct or via their style).
++        Lets the reference parser recognize lists whose numbers are rendered
++        by Word's numbering engine instead of being typed into the text."""
++        self.all_paragraphs()
++        return compute_list_numbers(
++            self._paragraphs, self.document, load_numbering_map(self.document))
++
+     def count_existing_footnotes(self) -> int:
+         """Number of existing (non-separator) footnote definitions."""
+         return len(snapshot_existing_footnotes(self.document).definitions)
+diff --git a/input/sample.docx b/input/sample.docx
+index db9b2fa0ad36266a4d04d79d08ef1d6b515648ed..27e2567937217aa11019d80e66cbea464eb73028 100644
+GIT binary patch
+delta 283
+zcmaE}jOooXCY}IqW)=|!1_llW$;lge&M`7cPTqWnQ65bHWts-2r?QAMfyCFbF|vZ_
+zjob^s;=#Q0^g;a3Hu<I?I;H3hGl&i<GXTrClurcf6R-Nt1{9wx(0C0*y=eRnQuVM&
+z6s+n;^GvX=$?aBP{`rniAX_FM?z0C`EdAyn%C_GYMAh`$fT&#%-p_sy5YKsnHHd1M
+y;0B^jOaQB7pXdPMc}}zgQJoVVLDZRvU^96qd4YJ5lUzX5{7GOX_aT)0WM2S+<YY4d
+
+delta 283
+zcmaE}jOooXCY}IqW)=|!1_llWoz9Is=NOrEIyc{8ln2v)nWlm1sVw45An|o<jI1Df
+zBliNZcrfogeGvb%O};6JPAPiB45EX|48Za&<rBgB#H+ru0mUZ^G+qNyFB-ptR6T4G
+z1*`heJQJ*Ia=R6nf4<`r$d<{6`|Lp!OTRgYvhBA8Q8oQGAZizc_p{#v#B-it4Wb$*
+yxPhn>6Tm9jCpv(5o)hgrROduT5OroE*i7C@ULaoNBo`1he-c>9eF!B#*%tsT1Z8&s
+
+diff --git a/main.py b/main.py
+index f8906b7..924d678 100644
+--- a/main.py
++++ b/main.py
+@@ -53,6 +53,11 @@ def _parse_args(argv):
+                    help="Overwrite output if it already exists")
+     p.add_argument("--input-dir", default="input")
+     p.add_argument("--output-dir", default="output")
++    p.add_argument("--inspect", action="store_true",
++                   help="Diagnose the reference section only (read-only; no "
++                        "output is produced). Prints how each entry line is "
++                        "interpreted so you can see why a reference was/wasn't "
++                        "recognized.")
+     return p.parse_args(argv)
+ 
+ 
+@@ -63,6 +68,89 @@ def _current_section(paragraphs, idx):
+     return "(document start)"
+ 
+ 
++def inspect_reference_section(config):
++    """Read-only diagnostic: show how the reference section is detected and how
++    each entry line is interpreted (typed number / Word list number / URLs).
++    Produces no output file. Returns 0 (info printed) or 2 (usage error)."""
++    if not config.input_path:
++        docs = sorted(Path(config.input_dir).glob("*.docx"))
++        if not docs:
++            print(f"No .docx found in {config.input_dir}/. Provide --input.")
++            return 2
++        config.input_path = str(docs[0])
++    inp = Path(config.input_path)
++    if not inp.exists():
++        print(f"Input not found: {inp}")
++        return 2
++
++    from document_reader import is_style_heading
++    from reference_parser import _is_entry_line, _extract_urls
++
++    reader = DocumentReader(inp)
++    paragraphs = reader.all_paragraphs()
++    list_numbers = reader.list_numbers()
++    parser = ReferenceParser(config)
++
++    print("Reference-section inspection (read-only)")
++    print(f"Input: {inp}")
++    ref_start = parser.find_reference_section(paragraphs, config, list_numbers)
++    if ref_start is None:
++        print("RESULT: reference section could NOT be confidently identified.")
++        print("The tool would ABORT (no output). Nothing to inspect.")
++        return 0
++    start_idx, method, confidence, note = ref_start
++    print(f"RESULT: section found at paragraph {start_idx + 1} "
++          f"(method={method}, confidence={confidence})")
++    print(f"NOTE  : {note}")
++    print()
++
++    print(f"{'idx':>4}  {'num':>4}  {'src':<7}  {'urls':<4}  text")
++    print("-" * 78)
++    ref_map, warnings = parser.parse_references(paragraphs, start_idx, list_numbers)
++    shown = 0
++    for i in range(start_idx, len(paragraphs)):
++        p = paragraphs[i]
++        if is_style_heading(p):
++            print(f"{i + 1:>4}  {'':>4}  {'stop':<7}  -     "
++                  f"(next heading: {(p.text or '').strip()[:40]!r})")
++            break
++        t = (p.text or "").strip()
++        if not t:
++            continue
++        typed = _is_entry_line(t)
++        auto = list_numbers.get(i)
++        num = typed if typed is not None else auto
++        src = "typed" if typed is not None else ("list" if auto is not None else "-")
++        urls = _extract_urls(t)
++        shown += 1
++        print(f"{i + 1:>4}  {str(num):>4}  {src:<7}  {str(len(urls)):<4}  {t[:48]}")
++        if shown >= 40:
++            print("    ... (truncated)")
++            break
++    print()
++    print(f"Parsed {len(ref_map)} reference(s):")
++    for num in sorted(ref_map):
++        v = ref_map[num]
++        flag = "" if v["url"] else "   <-- NO URL (citations to it stay unchanged)"
++        print(f"  [{num}] -> {v['url'] or '(none)'}{flag}")
++    for w in warnings:
++        print(f"  warning: {w}")
++    if not ref_map:
++        print()
++        print("  No numbered entries recognized. The tool will insert NOTHING "
++              "(it never invents numbers).")
++        print("  Common causes:")
++        print("   - references are a Word NUMBERED list: should now be detected "
++              "as 'list' above (pull the latest code and re-run);")
++        print("   - references are BULLETED or have no numbers at all: numbered "
++              "citations cannot be mapped safely;")
++        print("   - entries start with something other than a number (e.g. "
++              "author names) with no visible list numbers.")
++        print("  If this looks wrong, share these lines (or a sanitized copy "
++              "of the .docx) for diagnosis.")
++    return 0
++
++
+ def _build_report_rows(citations, paragraphs, locations, ref_map):
+     rows = []
+     for c in citations:
+@@ -116,8 +204,12 @@ def run(config):
+     raw_texts = reader.raw_texts()
+     existing = reader.existing_footnotes()
+ 
++    # Visible numbers of Word auto-numbered paragraphs (numbering.xml), so
++    # reference lists numbered by Word's list engine are recognized too.
++    list_numbers = reader.list_numbers()
++
+     parser = ReferenceParser(config)
+-    ref_start = parser.find_reference_section(paragraphs, config)
++    ref_start = parser.find_reference_section(paragraphs, config, list_numbers)
+     if ref_start is None:
+         print("ERROR: Could not confidently locate the reference/bibliography "
+               "section. Stopping safely - the input file is unchanged.")
+@@ -144,7 +236,7 @@ def run(config):
+         return 1
+ 
+     start_idx, method, confidence, note = ref_start
+-    ref_map, warnings = parser.parse_references(paragraphs, start_idx)
++    ref_map, warnings = parser.parse_references(paragraphs, start_idx, list_numbers)
+     citations = CitationDetector().detect(paragraphs, start_idx)
+ 
+     print(f"Reference section : FOUND ({method}, {confidence}) - {note}")
+@@ -263,6 +355,8 @@ def main(argv=None):
+     config.overwrite_output = args.overwrite
+     config.input_dir = Path(args.input_dir)
+     config.output_dir = Path(args.output_dir)
++    if args.inspect:
++        return inspect_reference_section(config)
+     return run(config)
+ 
+ 
+diff --git a/output/RALF Reflective Professional Competency Account_with_footnotes.docx b/output/RALF Reflective Professional Competency Account_with_footnotes.docx
+new file mode 100644
+index 0000000000000000000000000000000000000000..82417d2c825cc097a3478b910808c3575ea4147b
+GIT binary patch
+literal 18001
+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
+R&cMJ6gpR;5w_i>m9srB7bO8VW
+
+literal 0
+HcmV?d00001
+
+diff --git a/output/citation_review_report.csv b/output/citation_review_report.csv
+index ff90424..bdcde81 100644
+--- a/output/citation_review_report.csv
++++ b/output/citation_review_report.csv
+@@ -1,32 +1,28 @@
+ Citation Number,Location,Citation Text,Reference Text,URL,Action,Status,Notes
+-1,para 3 (body); section: 1. Introduction,[1],1. Author A. Title one. Journal. 2020. https://example.com/one,https://example.com/one,Footnote inserted,SUCCESS,Inline citation
+-2,para 3 (body); section: 1. Introduction,[2],2. Author B. Title two. Journal. 2021. https://example.com/two,https://example.com/two,Footnote inserted,SUCCESS,Inline citation
+-3,para 3 (body); section: 1. Introduction,[3],3. Author C. Title three. https://doi.org/10.1000/three,https://doi.org/10.1000/three,Footnote inserted,SUCCESS,Inline citation
+-2,para 3 (body); section: 1. Introduction,[2],2. Author B. Title two. Journal. 2021. https://example.com/two,https://example.com/two,Footnote inserted,SUCCESS,Inline citation
+-4,para 5 (body); section: 2. Background,[4]-[6],4. Author D. Title four. https://example.com/four,https://example.com/four,Footnote inserted,SUCCESS,Range expanded
+-5,para 5 (body); section: 2. Background,[4]-[6],5. Author E. Title five. https://example.com/five,https://example.com/five,Footnote inserted,SUCCESS,Range expanded
+-6,para 5 (body); section: 2. Background,[4]-[6],6. Author F. Title six. https://example.com/six,https://example.com/six,Footnote inserted,SUCCESS,Range expanded
+-7,para 5 (body); section: 2. Background,[7],7. Author G. Title seven. https://example.com/seven,https://example.com/seven,Footnote inserted,SUCCESS,Inline citation
+-8,para 5 (body); section: 2. Background,[8],8. Author H. Title eight. https://example.com/eight,https://example.com/eight,Footnote inserted,SUCCESS,Inline citation
+-1,para 5 (body); section: 2. Background,[1],1. Author A. Title one. Journal. 2020. https://example.com/one,https://example.com/one,Footnote inserted,SUCCESS,Inline citation
+-9,para 7 (table r1c1); section: 3. Methods,[9],9. Author I. Title nine. https://example.com/nine,https://example.com/nine,Footnote inserted,SUCCESS,Inline citation
++1,para 32 (body); section: 1. Selected Competency and Context,[1],"Gemino A, Reich BH. Program management within digital transformation: the emerging importance of technology architecture, product management, and human capital ",https://doi.org/10.1177/87569728231173298,Footnote inserted,SUCCESS,Inline citation
++2,para 32 (body); section: 1. Selected Competency and Context,[2],"Tumpa RJ, Naeni L. Improving decision-making and stakeholder engagement at project governance using digital technology for sustainable infrastructure projects. ",https://doi.org/10.1108/SASBE-10-2024-0451,Footnote inserted,SUCCESS,Inline citation
++3,para 34 (body); section: 2. Artefact Description and Evidence,[3],"Glogar M, Ercegovic Razic S. Sustainable pre-treatment of cellulose knitwear in digital pigment printing processes. International Journal of Clothing Science an",https://doi.org/10.1108/IJCST-03-2024-0061,Footnote inserted,SUCCESS,Inline citation
++2,para 34 (body); section: 2. Artefact Description and Evidence,[2],"Tumpa RJ, Naeni L. Improving decision-making and stakeholder engagement at project governance using digital technology for sustainable infrastructure projects. ",https://doi.org/10.1108/SASBE-10-2024-0451,Footnote inserted,SUCCESS,Inline citation
++4,para 34 (body); section: 2. Artefact Description and Evidence,[4],"Casadei P, Iammarino S. Backshoring, offshoring and staying at home: evidence from the UK textile and apparel industry. Operations Management Research. 2023;16(",https://doi.org/10.1007/s12063-023-00394-9,Footnote inserted,SUCCESS,Inline citation
++2,para 39 (body); section: 3. Critical Reflection and Evaluation,[2],"Tumpa RJ, Naeni L. Improving decision-making and stakeholder engagement at project governance using digital technology for sustainable infrastructure projects. ",https://doi.org/10.1108/SASBE-10-2024-0451,Footnote inserted,SUCCESS,Inline citation
++5,para 39 (body); section: 3. Critical Reflection and Evaluation,[5],"Flynn SE, Levie F. Towards reflective project management: introducing the Portfolio-in-Practice. Irish Journal of Technology Enhanced Learning. 2021;6(1):118–13",https://doi.org/10.22554/ijtel.v6i1.94,Footnote inserted,SUCCESS,Inline citation
+ 
+ SUMMARY
+-Input,input/sample.docx
+-Output,output/sample_with_footnotes.docx
+-Reference_section,"FOUND (heading, high)"
+-Reference_section_method,heading
++Input,input/RALF Reflective Professional Competency Account.docx
++Output,output/RALF Reflective Professional Competency Account_with_footnotes.docx
++Reference_section,"FOUND (heading-bold, high)"
++Reference_section_method,heading-bold
+ Reference_section_confidence,high
+-References_detected,11
+-URLs_detected,10
+-Citation_markers_detected,9
+-Footnotes_inserted,11
+-Existing_footnotes_detected,1
++References_detected,5
++URLs_detected,5
++Citation_markers_detected,7
++Footnotes_inserted,7
++Existing_footnotes_detected,0
+ Existing_footnotes_preserved,True
+ Unresolved_citations,0
+-Missing_URLs,10
++Missing_URLs,0
+ Ambiguous_citations,0
+-Uncited_references,"10, 11"
++Uncited_references,0
+ Previously_processed,0
+ Output_valid_docx,True
+ Reopened_with_python_docx,True
+diff --git a/reference_parser.py b/reference_parser.py
+index 5df20f2..f39f018 100644
+--- a/reference_parser.py
++++ b/reference_parser.py
+@@ -75,16 +75,22 @@ class ReferenceParser:
+     # ------------------------------------------------------------------
+     # Section location
+     # ------------------------------------------------------------------
+-    def find_reference_section(self, paragraphs, config):
++    def find_reference_section(self, paragraphs, config, list_numbers=None):
+         """Return (start_index, method, confidence, note) or None.
+ 
+         start_index is the first paragraph of the reference list (the first
+         entry line, or the paragraph after the heading). None means the
+-        section cannot be confidently identified -> abort, do not guess."""
++        section cannot be confidently identified -> abort, do not guess.
++
++        ``list_numbers`` (optional) maps paragraph index -> visible number of
++        Word auto-numbered (w:numPr / "List Number") paragraphs, so lists
++        whose numbers are rendered by Word's numbering engine count as
++        numbered entries too."""
+         cfg = config or self.config
+         n = len(paragraphs)
+         if n == 0:
+             return None
++        list_numbers = list_numbers or {}
+ 
+         keywords = tuple(k.lower() for k in cfg.reference_keywords)
+ 
+@@ -121,7 +127,7 @@ class ReferenceParser:
+                 j += 1
+             if j < len(paragraphs) and is_style_heading(paragraphs[j]):
+                 continue
+-            block = self._scan_block(paragraphs, j)
++            block = self._scan_block(paragraphs, j, list_numbers)
+             if block and block.entries >= cfg.min_reference_entries \
+                     and block.urls >= cfg.min_reference_urls:
+                 return block.start, "heading+block", "medium", (
+@@ -133,8 +139,8 @@ class ReferenceParser:
+         best = None
+         i = 0
+         while i < n:
+-            if i >= min_start and _is_entry_line((paragraphs[i].text or "")):
+-                block = self._scan_block(paragraphs, i)
++            if i >= min_start and self._is_entry_start(paragraphs, i, list_numbers):
++                block = self._scan_block(paragraphs, i, list_numbers)
+                 if (block and block.entries >= cfg.min_reference_entries
+                         and block.urls >= cfg.min_reference_urls):
+                     key = (block.entries, block.urls, block.start)
+@@ -153,12 +159,18 @@ class ReferenceParser:
+     # ------------------------------------------------------------------
+     # Block scanning
+     # ------------------------------------------------------------------
+-    def _scan_block(self, paragraphs, start):
++    def _is_entry_start(self, paragraphs, i, list_numbers):
++        """True if paragraph i begins a numbered entry: either a typed number
++        ("1. …", "[1] …") or a Word auto-numbered paragraph."""
++        return i in list_numbers or _is_entry_line((paragraphs[i].text or ""))
++
++    def _scan_block(self, paragraphs, start, list_numbers=None):
+         """Maximal run of paragraphs starting at ``start`` that forms a
+         candidate reference list. Returns a small object or None."""
+         if start >= len(paragraphs):
+             return None
+-        if not _is_entry_line((paragraphs[start].text or "")):
++        list_numbers = list_numbers or {}
++        if not self._is_entry_start(paragraphs, start, list_numbers):
+             return None
+         entries = 0
+         urls = 0
+@@ -168,7 +180,7 @@ class ReferenceParser:
+             if is_style_heading(p):
+                 break
+             t = (p.text or "").strip()
+-            if _is_entry_line(t):
++            if self._is_entry_start(paragraphs, j, list_numbers):
+                 entries += 1
+                 urls += len(_extract_urls(t))
+             j += 1
+@@ -177,10 +189,16 @@ class ReferenceParser:
+     # ------------------------------------------------------------------
+     # Entry parsing
+     # ------------------------------------------------------------------
+-    def parse_references(self, paragraphs, start_index):
++    def parse_references(self, paragraphs, start_index, list_numbers=None):
+         """Extract number -> {url, text} for the reference entries from
+         ``start_index`` to the next styled heading (or end of document).
+ 
++        Entry numbers come from, in priority order:
++          1. a number typed into the line ("1. …", "1) …", "[1] …");
++          2. Word's automatic list numbering (``list_numbers``, i.e. the
++             number Word renders for w:numPr / "List Number" paragraphs) -
++             the number the reader actually sees in the document.
++
+         Rules:
+           * continuation (indented/wrapped) lines are appended to the current
+             entry;
+@@ -195,11 +213,14 @@ class ReferenceParser:
+         self.warnings = []
+         entries = {}      # num -> {"text": str}
+         current = None
+-        for p in paragraphs[start_index:]:
++        list_numbers = list_numbers or {}
++        for offset, p in enumerate(paragraphs[start_index:]):
+             if is_style_heading(p):
+                 break
+             t = raw_text_of(p._p)
+             num = _is_entry_line(t)
++            if num is None:
++                num = list_numbers.get(start_index + offset)
+             if num is not None:
+                 if num in entries:
+                     self.warnings.append(
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+index 46e66e0..b923c89 100644
+--- a/tests/test_pipeline.py
++++ b/tests/test_pipeline.py
+@@ -593,6 +593,131 @@ def test_input_hash_unchanged(tmp_path):
+     assert sha256(src) == before
+ 
+ 
++def test_auto_numbered_reference_list(tmp_path):
++    """References whose numbers come from Word's list engine (List Number
++    style, i.e. w:numPr resolved via the style chain + numbering.xml) must be
++    recognized; the numbers are NOT in the paragraph text."""
++    doc = Document()
++    doc.add_paragraph("The body cites [1] and [2].")
++    doc.add_heading("References", level=1)
++    doc.add_paragraph("Alpha. One. 2020. https://example.com/one",
++                      style="List Number")
++    doc.add_paragraph("Beta. Two. 2021. https://example.com/two",
++                      style="List Number")
++    doc.add_paragraph("Gamma. Three. 2022. https://example.com/three",
++                      style="List Number")
++    src = Path(tmp_path / "t.docx")
++    doc.save(str(src))
++    # sanity: the numbers really are absent from the text
++    d2 = Document(src)
++    assert not any(re.match(r"^\s*\d+\.", p.text) for p in d2.paragraphs[2:])
++    rc, _ = run_tool(src, tmp_path)
++    assert rc == 0
++    doc2, _z, ft = load(output_path(tmp_path))
++    urls = [fn_text(f) for f in sorted(regular(ft), key=lambda f: int(f.get(qn("w:id"))))]
++    assert urls[:2] == ["https://example.com/one", "https://example.com/two"]
++    _rows, summary = read_csv(tmp_path)
++    assert summary["References_detected"] == "3"
++
++
++def test_bullet_list_references_not_entries(tmp_path):
++    """A bulleted (non-decimal) list must NOT be treated as numbered entries
++    - no mapping is invented."""
++    doc = Document()
++    doc.add_paragraph("The body cites [1].")
++    doc.add_heading("References", level=1)
++    doc.add_paragraph("Alpha. One. https://example.com/one", style="List Bullet")
++    doc.add_paragraph("Beta. Two. https://example.com/two", style="List Bullet")
++    doc.add_paragraph("Gamma. Three. https://example.com/three", style="List Bullet")
++    src = Path(tmp_path / "t.docx")
++    doc.save(str(src))
++    rc, _ = run_tool(src, tmp_path)
++    assert rc == 0
++    _d, _z, ft = load(output_path(tmp_path))
++    assert len(regular(ft)) == 0  # nothing invented
++    _rows, summary = read_csv(tmp_path)
++    assert summary["References_detected"] == "0"
++
++
++def test_typed_number_beats_list_number(tmp_path):
++    """If a line has BOTH a typed number and list numbering, the typed number
++    wins (it is what the reader sees first)."""
++    doc = Document()
++    doc.add_paragraph("The body cites [9].")
++    doc.add_heading("References", level=1)
++    doc.add_paragraph("9. Alpha. One. https://example.com/nine",
++                      style="List Number")
++    src = Path(tmp_path / "t.docx")
++    doc.save(str(src))
++    rc, _ = run_tool(src, tmp_path)
++    assert rc == 0
++    _d, _z, ft = load(output_path(tmp_path))
++    urls = {fn_text(f) for f in regular(ft)}
++    assert urls == {"https://example.com/nine"}
++    _rows, summary = read_csv(tmp_path)
++    assert summary["References_detected"] == "1"
++
++
++def test_last_rendered_page_break_preserved(tmp_path):
++    """A run containing Word's zero-width w:lastRenderedPageBreak render hint
++    is safe to split: the citation is processed AND the hint (plus the exact
++    text) survives in the output."""
++    doc = Document()
++    p = doc.add_paragraph()
++    r = p.add_run()
++    lrb = OxmlElement("w:lastRenderedPageBreak")
++    t = OxmlElement("w:t")
++    t.text = "competency because governance [2]. More text after."
++    r._r.append(lrb)
++    r._r.append(t)
++    doc.add_heading("References", level=1)
++    for ref in REFS:
++        doc.add_paragraph(ref)
++    src = Path(tmp_path / "t.docx")
++    doc.save(str(src))
++    rc, _ = run_tool(src, tmp_path)
++    assert rc == 0
++    doc2, z, ft = load(output_path(tmp_path))
++    assert len(regular(ft)) == 1
++    assert fn_text(regular(ft)[0]) == "https://example.com/two"
++    xml = z.read("word/document.xml").decode()
++    assert xml.count("lastRenderedPageBreak") == 1  # hint preserved
++    assert "competency because governance " in xml
++    assert "More text after." in xml
++    # the hint must sit in the BEFORE fragment (it was at text position 0)
++    i_lrb = xml.find("lastRenderedPageBreak")
++    i_ref = xml.find("footnoteReference")
++    i_after = xml.find("More text after.")
++    assert i_lrb != -1 and i_lrb < i_ref < i_after
++    _rows, summary = read_csv(tmp_path)
++    assert summary["Ambiguous_citations"] == "0"
++
++
++def test_multiple_citations_in_one_run_with_break_hint(tmp_path):
++    """Two citations in one run that also carries a render hint: both are
++    processed and the hint survives."""
++    doc = Document()
++    p = doc.add_paragraph()
++    r = p.add_run()
++    lrb = OxmlElement("w:lastRenderedPageBreak")
++    t = OxmlElement("w:t")
++    t.text = "Before [1] middle [2] after."
++    r._r.append(lrb)
++    r._r.append(t)
++    doc.add_heading("References", level=1)
++    for ref in REFS:
++        doc.add_paragraph(ref)
++    src = Path(tmp_path / "t.docx")
++    doc.save(str(src))
++    rc, _ = run_tool(src, tmp_path)
++    assert rc == 0
++    _d, z, ft = load(output_path(tmp_path))
++    assert len(regular(ft)) == 2
++    xml = z.read("word/document.xml").decode()
++    assert xml.count("lastRenderedPageBreak") == 1
++    assert no_markers(body_text_before_refs(_d))
++
++
+ # --------------------------------------------------------------------------
+ # 16-18: reference-section detection
+ # --------------------------------------------------------------------------
+diff --git a/word_footnotes.py b/word_footnotes.py
+index 76e8bef..df646b4 100644
+--- a/word_footnotes.py
++++ b/word_footnotes.py
+@@ -114,18 +114,6 @@ def _set_rstyle(rpr, style_id):
+     return rpr
+ 
+ 
+-def make_text_run(text, rpr):
+-    """Plain text run; rPr is deep-copied so the original run is unaffected."""
+-    r = OxmlElement("w:r")
+-    if rpr is not None:
+-        r.append(copy.deepcopy(rpr))
+-    t = OxmlElement("w:t")
+-    t.set(qn("xml:space"), "preserve")
+-    t.text = text
+-    r.append(t)
+-    return r
+-
+-
+ def make_ref_run(fid, rpr, ref_style_id):
+     """A run carrying a genuine <w:footnoteReference>; keeps the source run's
+     character formatting and adds the FootnoteReference character style."""
+@@ -231,17 +219,68 @@ class XmlFootnoteBackend:
+ # --------------------------------------------------------------------------
+ # Safety helpers
+ # --------------------------------------------------------------------------
++_ZERO_WIDTH_TAGS = (qn("w:lastRenderedPageBreak"),)
++
++
+ def _run_is_simple(run_elem):
+-    """True iff the run contains ONLY rPr/t children - i.e. pure text.
+-    Any drawing, object, field character, tab, break, inline content control,
+-    or anything else makes the run unsafe to split."""
+-    return all(child.tag in (qn("w:rPr"), qn("w:t")) for child in run_elem)
++    """True iff the run is safe to split: its children are exclusively
++    ``w:rPr``, ``w:t`` and zero-width render hints
++    (``w:lastRenderedPageBreak`` - a stale page-break cache that Word writes
++    itself and that carries no content). Any drawing, object, field character,
++    tab, break, inline content control, or other content element makes the
++    run unsafe to split."""
++    return all(child.tag in (qn("w:rPr"), qn("w:t")) + _ZERO_WIDTH_TAGS
++               for child in run_elem)
+ 
+ 
+ def _is_ref_run(run_elem):
+     return run_elem.tag == qn("w:r") and run_elem.find(qn("w:footnoteReference")) is not None
+ 
+ 
++# --------------------------------------------------------------------------
++# Run splitting (structure-preserving)
++# --------------------------------------------------------------------------
++def _mk_t(text):
++    t = OxmlElement("w:t")
++    t.set(qn("xml:space"), "preserve")
++    t.text = text
++    return t
++
++
++def _segment_children(children, a, b, end_inclusive=False):
++    """Deep-copied run children covering text range ``[a, b)`` in original
++    order: ``w:t`` fragments trimmed at the range edges (original w:t
++    segmentation is preserved where a whole element fits), and zero-width
++    children at their text positions. A zero-width child exactly at ``b`` is
++    included only when ``end_inclusive`` (the run-end case)."""
++    out = []
++    for p, ln, elem in children:
++        if ln == 0:  # zero-width render hint
++            if a <= p < b or (end_inclusive and p == b):
++                out.append(copy.deepcopy(elem))
++            continue
++        t0, t1 = p, p + ln
++        if t1 <= a or t0 >= b:
++            continue
++        text = elem.text or ""
++        if t0 < a or t1 > b:
++            out.append(_mk_t(text[max(0, a - t0):min(len(text), b - t0)]))
++        else:
++            out.append(copy.deepcopy(elem))
++    return out
++
++
++def make_run_with(elems, rpr):
++    """A run containing the given child elements (already deep copies) plus a
++    deep-copied rPr."""
++    r = OxmlElement("w:r")
++    if rpr is not None:
++        r.append(copy.deepcopy(rpr))
++    for e in elems:
++        r.append(e)
++    return r
++
++
+ # --------------------------------------------------------------------------
+ # Paragraph processing (surgical)
+ # --------------------------------------------------------------------------
+@@ -341,27 +380,39 @@ def _build_run_replacement(run_elem, cites, replace_marker, ref_style_id):
+     Layout:
+       replace mode:  [before-text] [ref][ref]... [after-text]
+       keep mode:     [before-text] [marker-text] [ref][ref]... [after-text]
+-    All text runs deep-copy the original run's rPr; ref runs additionally
+-    carry the FootnoteReference character style."""
+-    text = "".join(t.text or "" for t in run_elem.findall(qn("w:t")))
++
++    Structure-preserving: each text piece is built from the ORIGINAL run's
++    children (w:t fragments keep their original segmentation; zero-width
++    render hints keep their positions), all carrying the original run's rPr.
++    Ref runs additionally carry the FootnoteReference character style."""
+     rpr = run_elem.find(qn("w:rPr"))
+-    new_elems = []
++    children = []
+     pos = 0
++    for child in run_elem:
++        if child.tag == qn("w:t"):
++            children.append((pos, len(child.text or ""), child))
++            pos += len(child.text or "")
++        elif child.tag in _ZERO_WIDTH_TAGS:
++            children.append((pos, 0, child))
++        # w:rPr handled separately (deep-copied onto every emitted run)
++
++    new_elems = []
++    seg_start = 0
+     for c in cites:
+         ls, le = c.local_start, c.local_end
+-        before = text[pos:ls]
+-        if before:
+-            new_elems.append(make_text_run(before, rpr))
++        seg = _segment_children(children, seg_start, ls)
++        if seg:
++            new_elems.append(make_run_with(seg, rpr))
+         if not replace_marker:
+-            marker = text[ls:le]
+-            if marker:
+-                new_elems.append(make_text_run(marker, rpr))
++            mseg = _segment_children(children, ls, le)
++            if mseg:
++                new_elems.append(make_run_with(mseg, rpr))
+         for _num, fid in c.fids:
+             new_elems.append(make_ref_run(fid, rpr, ref_style_id))
+-        pos = le
+-    after = text[pos:]
+-    if after:
+-        new_elems.append(make_text_run(after, rpr))
++        seg_start = le
++    last_segs = _segment_children(children, seg_start, pos, end_inclusive=True)
++    if last_segs:
++        new_elems.append(make_run_with(last_segs, rpr))
+     return new_elems
+ 
+ 
+-- 
+2.39.5

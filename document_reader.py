@@ -154,128 +154,6 @@ def is_heading(paragraph) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Word automatic list numbering (w:numPr / numbering.xml)
-# --------------------------------------------------------------------------
-def load_numbering_map(doc) -> dict:
-    """Parse word/numbering.xml into {numId: {ilvl: (start, numFmt)}}.
-
-    Empty dict when the document has no numbering part."""
-    from lxml import etree
-    part = None
-    for p in doc.part.package.iter_parts():
-        if str(p.partname).endswith("numbering.xml"):
-            part = p
-            break
-    if part is None:
-        return {}
-    root = etree.fromstring(part.blob)
-    abstract = {}
-    for an in root.findall(qn("w:abstractNum")):
-        aid = an.get(qn("w:abstractNumId"))
-        lvls = {}
-        for lvl in an.findall(qn("w:lvl")):
-            ilvl = lvl.get(qn("w:ilvl")) or "0"
-            start_el = lvl.find(qn("w:start"))
-            fmt_el = lvl.find(qn("w:numFmt"))
-            try:
-                start = int(start_el.get(qn("w:val"))) if start_el is not None else 1
-            except (TypeError, ValueError):
-                start = 1
-            fmt = fmt_el.get(qn("w:val")) if fmt_el is not None else "decimal"
-            lvls[ilvl] = (start, fmt)
-        abstract[aid] = lvls
-    out = {}
-    for num in root.findall(qn("w:num")):
-        num_id = num.get(qn("w:numId"))
-        aid_el = num.find(qn("w:abstractNumId"))
-        if num_id is None or aid_el is None:
-            continue
-        aid = aid_el.get(qn("w:val"))
-        if aid in abstract:
-            out[num_id] = abstract[aid]
-    return out
-
-
-def _style_chain_numpr(doc, style_id, _seen=None):
-    """numPr element from the style definition (following basedOn), or None."""
-    if _seen is None:
-        _seen = set()
-    if not style_id or style_id in _seen:
-        return None
-    _seen.add(style_id)
-    style = None
-    for s in doc.styles.element.findall(qn("w:style")):
-        if s.get(qn("w:styleId")) == style_id:
-            style = s
-            break
-    if style is None:
-        return None
-    pPr = style.find(qn("w:pPr"))
-    if pPr is not None:
-        numPr = pPr.find(qn("w:numPr"))
-        if numPr is not None:
-            return numPr
-    based = style.find(qn("w:basedOn"))
-    if based is not None:
-        return _style_chain_numpr(doc, based.get(qn("w:val")), _seen)
-    return None
-
-
-def paragraph_numpr_info(p_elem, doc, numbering_map):
-    """Visible-number info for a paragraph, or None.
-
-    Returns (numId, ilvl, start_value). The numbering is taken from the
-    paragraph's own <w:numPr> or, failing that, from its paragraph style
-    chain (this is how "List Number" styled paragraphs are numbered). Only
-    decimal numbering qualifies (bullets/letters/romans are not reference
-    numbers)."""
-    if not numbering_map:
-        return None
-    numPr = None
-    pPr = p_elem.find(qn("w:pPr"))
-    if pPr is not None:
-        numPr = pPr.find(qn("w:numPr"))
-        if numPr is None:
-            pstyle = pPr.find(qn("w:pStyle"))
-            if pstyle is not None:
-                numPr = _style_chain_numpr(doc, pstyle.get(qn("w:val")))
-    if numPr is None:
-        return None
-    numId_el = numPr.find(qn("w:numId"))
-    ilvl_el = numPr.find(qn("w:ilvl"))
-    if numId_el is None:
-        return None
-    num_id = numId_el.get(qn("w:val"))
-    if num_id in (None, "0"):
-        return None
-    ilvl = (ilvl_el.get(qn("w:val")) if ilvl_el is not None else "0") or "0"
-    lvls = numbering_map.get(num_id)
-    if not lvls:
-        return None
-    start, fmt = lvls.get(ilvl, (1, "decimal"))
-    if fmt != "decimal":
-        return None
-    return num_id, ilvl, start
-
-
-def compute_list_numbers(paragraphs, doc, numbering_map) -> dict:
-    """Map paragraph index -> visible automatic number (document-wide
-    sequence per list, as rendered by Word). Only decimal lists."""
-    seq = {}
-    out = {}
-    for i, p in enumerate(paragraphs):
-        info = paragraph_numpr_info(p._p, doc, numbering_map)
-        if info is None:
-            continue
-        num_id, ilvl, start = info
-        key = (num_id, ilvl)
-        n = seq.get(key, start)
-        seq[key] = n + 1
-        out[i] = n
-    return out
-
-
-# --------------------------------------------------------------------------
 # Existing-footnote snapshot (input-side, pre-edit)
 # --------------------------------------------------------------------------
 @dataclass
@@ -334,19 +212,9 @@ class DocumentReader:
         """raw_text_of() for every paragraph, in all_paragraphs() order."""
         return [raw_text_of(p._p) for p in self.all_paragraphs()]
 
-    def list_numbers(self) -> dict:
-        """{paragraph_index: visible automatic number} for paragraphs that
-        belong to a Word decimal numbered list (direct or via their style).
-        Lets the reference parser recognize lists whose numbers are rendered
-        by Word's numbering engine instead of being typed into the text."""
-        self.all_paragraphs()
-        return compute_list_numbers(
-            self._paragraphs, self.document, load_numbering_map(self.document))
-
     def count_existing_footnotes(self) -> int:
         """Number of existing (non-separator) footnote definitions."""
         return len(snapshot_existing_footnotes(self.document).definitions)
 
     def existing_footnotes(self) -> FootnoteSnapshot:
         return snapshot_existing_footnotes(self.document)
-

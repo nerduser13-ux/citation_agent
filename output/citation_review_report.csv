@@ -1,28 +1,44 @@
 Citation Number,Location,Citation Text,Reference Text,URL,Action,Status,Notes
-1,para 32 (body); section: 1. Selected Competency and Context,[1],,,Not processed,ERROR,Reference 1 not found in reference section
-2,para 32 (body); section: 1. Selected Competency and Context,[2],,,Not processed,AMBIGUOUS,Citation run contains non-text content (field/drawing/break/...); left unchanged
-3,para 34 (body); section: 2. Artefact Description and Evidence,[3],,,Not processed,ERROR,Reference 3 not found in reference section
-2,para 34 (body); section: 2. Artefact Description and Evidence,[2],,,Not processed,ERROR,Reference 2 not found in reference section
-4,para 34 (body); section: 2. Artefact Description and Evidence,[4],,,Not processed,ERROR,Reference 4 not found in reference section
-2,para 39 (body); section: 3. Critical Reflection and Evaluation,[2],,,Not processed,ERROR,Reference 2 not found in reference section
-5,para 39 (body); section: 3. Critical Reflection and Evaluation,[5],,,Not processed,ERROR,Reference 5 not found in reference section
+1,para 4 (body); section: Introduction,[1],"1. Yesuf Y, Fields Z. Artificial intelligence adoption as a driver of innovation and competitiveness in SMEs: a bibliometric and systematic review. F1000Researc",https://pmc.ncbi.nlm.nih.gov/articles/PMC12749562/,Footnote inserted,SUCCESS,Inline citation
+1,para 6 (body); section: AI Adoption Frameworks and Enablers in SMEs,[1],"1. Yesuf Y, Fields Z. Artificial intelligence adoption as a driver of innovation and competitiveness in SMEs: a bibliometric and systematic review. F1000Researc",https://pmc.ncbi.nlm.nih.gov/articles/PMC12749562/,Footnote inserted,SUCCESS,Inline citation
+2,para 6 (body); section: AI Adoption Frameworks and Enablers in SMEs,[2],2. Ayinaddis SG. Artificial intelligence adoption dynamics and knowledge in SMEs and large firms: a systematic review and bibliometric analysis. J Innov Knowl. ,https://www.sciencedirect.com/science/article/pii/S2444569X25000320,Footnote inserted,SUCCESS,Inline citation
+3,para 7 (body); section: AI Adoption Frameworks and Enablers in SMEs,[3],"3. Sánchez E, Calderón R, Herrera F. Artificial intelligence adoption in SMEs: survey based on TOE–DOI framework, primary methodology and challenges. Appl Sci. ",https://doi.org/10.3390/app15126465,Not processed,AMBIGUOUS,Citation run contains non-text content (field/drawing/break/...); left unchanged
+4,para 7 (body); section: AI Adoption Frameworks and Enablers in SMEs,[4],"4. Badghish S, Soomro YA. Artificial intelligence adoption by SMEs to achieve sustainable business performance: application of technology–organization–environme",https://doi.org/10.3390/su16051864,Not processed,AMBIGUOUS,Citation run contains non-text content (field/drawing/break/...); left unchanged
+5,"para 9 (body); section: AI in Financial Decision-Making, Accounting and Auditing",[5],"5. Fonseka K, Jaharadak AA, Raman M. Impact of e-commerce adoption on business performance of SMEs in Sri Lanka; moderating role of artificial intelligence. Int",https://doi.org/10.1108/IJSE-12-2021-0752,Footnote inserted,SUCCESS,Inline citation
+6,"para 9 (body); section: AI in Financial Decision-Making, Accounting and Auditing",[6],"6. Musa AMH, Lefkir H. The role of artificial intelligence in achieving auditing quality for small and medium enterprises in the Kingdom of Saudi Arabia. Int J ",https://doi.org/10.5267/j.ijdns.2023.12.021,Footnote inserted,SUCCESS,Inline citation
+7,"para 10 (body); section: AI in Financial Decision-Making, Accounting and Auditing",[7],"7. Rawashdeh A, Bakhit M, Abaalkhail L. Determinants of artificial intelligence adoption in SMEs: the mediating role of accounting automation. Int J Data Netw S",https://www.growingscience.com/ijds/Vol7/ijdns_2022_120.pdf,Footnote inserted,SUCCESS,Inline citation
+8,"para 12 (body); section: AI, Credit Risk and Access to Finance",[8],"8. Bitetto A, Cerchiello P, Filomeni S, Tanda A, Tarantino B. Can we trust machine learning to predict the credit risk of small businesses? Rev Quant Finan Acc.",https://link.springer.com/article/10.1007/s11156-024-01278-0,Not processed,AMBIGUOUS,Citation run contains non-text content (field/drawing/break/...); left unchanged
+8,"para 12 (body); section: AI, Credit Risk and Access to Finance",[8],"8. Bitetto A, Cerchiello P, Filomeni S, Tanda A, Tarantino B. Can we trust machine learning to predict the credit risk of small businesses? Rev Quant Finan Acc.",https://link.springer.com/article/10.1007/s11156-024-01278-0,Not processed,AMBIGUOUS,Citation run contains non-text content (field/drawing/break/...); left unchanged
+9,"para 13 (body); section: AI, Credit Risk and Access to Finance",[9],"9. Jin L, Liu M. Unlocking financial opportunities: the substantial alleviation of financing constraints on small and micro enterprises through digital inclusiv",https://doi.org/10.1007/s13132-024-01863-7,Footnote inserted,SUCCESS,Inline citation
+10,"para 13 (body); section: AI, Credit Risk and Access to Finance",[10],"10. Enshassi M, Nathan RJ, Soekmawati, et al. Potentials of artificial intelligence in digital marketing and financial technology for small and medium enterpris",https://doi.org/10.11591/ijai.v13.i1.pp639-647,Footnote inserted,SUCCESS,Inline citation
+11,para 15 (body); section: Generative AI and Emerging Decision-Making Capabilities,[11],11. Gupta V. An empirical evaluation of a generative artificial intelligence technology adoption model from entrepreneurs' perspectives. Systems. 2024;12(3):103,https://doi.org/10.3390/systems12030103,Footnote inserted,SUCCESS,Inline citation
+12,para 15 (body); section: Generative AI and Emerging Decision-Making Capabilities,[12],"12. Jalil MF, Lynch P, Marikan DABA, et al. The influential role of artificial intelligence (AI) adoption in digital value creation for small and medium enterpr",https://doi.org/10.1007/s00146-024-01969-1,Footnote inserted,SUCCESS,Inline citation
+13,para 15 (body); section: Generative AI and Emerging Decision-Making Capabilities,[13],"13. Kumar M, Raut RD, Mangla SK, et al. The adoption of artificial intelligence powered workforce management for effective revenue growth of micro, small, and m",https://doi.org/10.1080/09537287.2022.2131620,Footnote inserted,SUCCESS,Inline citation
+1,para 17 (body); section: Critical Evaluation and Identification of the Gap,[1],"1. Yesuf Y, Fields Z. Artificial intelligence adoption as a driver of innovation and competitiveness in SMEs: a bibliometric and systematic review. F1000Researc",https://pmc.ncbi.nlm.nih.gov/articles/PMC12749562/,Footnote inserted,SUCCESS,Inline citation
+8,para 17 (body); section: Critical Evaluation and Identification of the Gap,[8],"8. Bitetto A, Cerchiello P, Filomeni S, Tanda A, Tarantino B. Can we trust machine learning to predict the credit risk of small businesses? Rev Quant Finan Acc.",https://link.springer.com/article/10.1007/s11156-024-01278-0,Footnote inserted,SUCCESS,Inline citation
+5,para 17 (body); section: Critical Evaluation and Identification of the Gap,[5],"5. Fonseka K, Jaharadak AA, Raman M. Impact of e-commerce adoption on business performance of SMEs in Sri Lanka; moderating role of artificial intelligence. Int",https://doi.org/10.1108/IJSE-12-2021-0752,Footnote inserted,SUCCESS,Inline citation
+6,para 17 (body); section: Critical Evaluation and Identification of the Gap,[6],"6. Musa AMH, Lefkir H. The role of artificial intelligence in achieving auditing quality for small and medium enterprises in the Kingdom of Saudi Arabia. Int J ",https://doi.org/10.5267/j.ijdns.2023.12.021,Footnote inserted,SUCCESS,Inline citation
+7,para 17 (body); section: Critical Evaluation and Identification of the Gap,[7],"7. Rawashdeh A, Bakhit M, Abaalkhail L. Determinants of artificial intelligence adoption in SMEs: the mediating role of accounting automation. Int J Data Netw S",https://www.growingscience.com/ijds/Vol7/ijdns_2022_120.pdf,Footnote inserted,SUCCESS,Inline citation
+6,para 17 (body); section: Critical Evaluation and Identification of the Gap,[6],"6. Musa AMH, Lefkir H. The role of artificial intelligence in achieving auditing quality for small and medium enterprises in the Kingdom of Saudi Arabia. Int J ",https://doi.org/10.5267/j.ijdns.2023.12.021,Footnote inserted,SUCCESS,Inline citation
+13,para 17 (body); section: Critical Evaluation and Identification of the Gap,[13],"13. Kumar M, Raut RD, Mangla SK, et al. The adoption of artificial intelligence powered workforce management for effective revenue growth of micro, small, and m",https://doi.org/10.1080/09537287.2022.2131620,Footnote inserted,SUCCESS,Inline citation
+6,para 18 (body); section: Critical Evaluation and Identification of the Gap,[6],"6. Musa AMH, Lefkir H. The role of artificial intelligence in achieving auditing quality for small and medium enterprises in the Kingdom of Saudi Arabia. Int J ",https://doi.org/10.5267/j.ijdns.2023.12.021,Footnote inserted,SUCCESS,Inline citation
 
 SUMMARY
-Input,input\RALF Reflective Professional Competency Account.docx
-Output,output\RALF Reflective Professional Competency Account_with_footnotes.docx
+Input,input\Artificial Intelligence Adoption and Financial Decision.docx
+Output,output\Artificial Intelligence Adoption and Financial Decision_footnotes_1.docx
 Reference_section,"FOUND (heading-bold, high)"
 Reference_section_method,heading-bold
 Reference_section_confidence,high
-References_detected,0
-URLs_detected,0
-Citation_markers_detected,7
-Footnotes_inserted,0
+References_detected,13
+URLs_detected,13
+Citation_markers_detected,23
+Footnotes_inserted,19
 Existing_footnotes_detected,0
 Existing_footnotes_preserved,True
-Unresolved_citations,6
+Unresolved_citations,0
 Missing_URLs,0
-Ambiguous_citations,1
-Uncited_references,0
+Ambiguous_citations,4
+Uncited_references,"3, 4"
 Previously_processed,0
 Output_valid_docx,True
 Reopened_with_python_docx,True

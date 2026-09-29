@@ -1,4 +1,5 @@
-"""
+"""reference_parser.py
+
 Locates the document's reference / bibliography section and extracts the
 number -> URL mapping. No URLs are invented: only URLs explicitly present in a
 reference entry are used (bare "DOI: 10.1000/abc" text is NOT turned into a URL).
@@ -32,6 +33,7 @@ except a single run of trailing sentence punctuation (.,;:!? ) is stripped.
 import re
 
 from document_reader import is_heading, is_style_heading, raw_text_of
+from docx.oxml.ns import qn
 
 # A reference entry line begins with "1.", "1)", "1 ", or "[1]" (then a space).
 ENTRY_NUM_RE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)[\.\)])\s+")
@@ -74,22 +76,16 @@ class ReferenceParser:
     # ------------------------------------------------------------------
     # Section location
     # ------------------------------------------------------------------
-    def find_reference_section(self, paragraphs, config, list_numbers=None):
+    def find_reference_section(self, paragraphs, config):
         """Return (start_index, method, confidence, note) or None.
 
         start_index is the first paragraph of the reference list (the first
         entry line, or the paragraph after the heading). None means the
-        section cannot be confidently identified -> abort, do not guess.
-
-        ``list_numbers`` (optional) maps paragraph index -> visible number of
-        Word auto-numbered (w:numPr / "List Number") paragraphs, so lists
-        whose numbers are rendered by Word's numbering engine count as
-        numbered entries too."""
+        section cannot be confidently identified -> abort, do not guess."""
         cfg = config or self.config
         n = len(paragraphs)
         if n == 0:
             return None
-        list_numbers = list_numbers or {}
 
         keywords = tuple(k.lower() for k in cfg.reference_keywords)
 
@@ -126,7 +122,7 @@ class ReferenceParser:
                 j += 1
             if j < len(paragraphs) and is_style_heading(paragraphs[j]):
                 continue
-            block = self._scan_block(paragraphs, j, list_numbers)
+            block = self._scan_block(paragraphs, j)
             if block and block.entries >= cfg.min_reference_entries \
                     and block.urls >= cfg.min_reference_urls:
                 return block.start, "heading+block", "medium", (
@@ -138,8 +134,8 @@ class ReferenceParser:
         best = None
         i = 0
         while i < n:
-            if i >= min_start and self._is_entry_start(paragraphs, i, list_numbers):
-                block = self._scan_block(paragraphs, i, list_numbers)
+            if i >= min_start and _is_entry_line((paragraphs[i].text or "")):
+                block = self._scan_block(paragraphs, i)
                 if (block and block.entries >= cfg.min_reference_entries
                         and block.urls >= cfg.min_reference_urls):
                     key = (block.entries, block.urls, block.start)
@@ -158,18 +154,12 @@ class ReferenceParser:
     # ------------------------------------------------------------------
     # Block scanning
     # ------------------------------------------------------------------
-    def _is_entry_start(self, paragraphs, i, list_numbers):
-        """True if paragraph i begins a numbered entry: either a typed number
-        ("1. …", "[1] …") or a Word auto-numbered paragraph."""
-        return i in list_numbers or _is_entry_line((paragraphs[i].text or ""))
-
-    def _scan_block(self, paragraphs, start, list_numbers=None):
+    def _scan_block(self, paragraphs, start):
         """Maximal run of paragraphs starting at ``start`` that forms a
         candidate reference list. Returns a small object or None."""
         if start >= len(paragraphs):
             return None
-        list_numbers = list_numbers or {}
-        if not self._is_entry_start(paragraphs, start, list_numbers):
+        if not _is_entry_line((paragraphs[start].text or "")):
             return None
         entries = 0
         urls = 0
@@ -179,7 +169,7 @@ class ReferenceParser:
             if is_style_heading(p):
                 break
             t = (p.text or "").strip()
-            if self._is_entry_start(paragraphs, j, list_numbers):
+            if _is_entry_line(t):
                 entries += 1
                 urls += len(_extract_urls(t))
             j += 1
@@ -188,15 +178,9 @@ class ReferenceParser:
     # ------------------------------------------------------------------
     # Entry parsing
     # ------------------------------------------------------------------
-    def parse_references(self, paragraphs, start_index, list_numbers=None):
+    def parse_references(self, paragraphs, start_index):
         """Extract number -> {url, text} for the reference entries from
         ``start_index`` to the next styled heading (or end of document).
-
-        Entry numbers come from, in priority order:
-          1. a number typed into the line ("1. …", "1) …", "[1] …");
-          2. Word's automatic list numbering (``list_numbers``, i.e. the
-             number Word renders for w:numPr / "List Number" paragraphs) -
-             the number the reader actually sees in the document.
 
         Rules:
           * continuation (indented/wrapped) lines are appended to the current
@@ -212,14 +196,16 @@ class ReferenceParser:
         self.warnings = []
         entries = {}      # num -> {"text": str}
         current = None
-        list_numbers = list_numbers or {}
-        for offset, p in enumerate(paragraphs[start_index:]):
+        list_counters = {}
+        for p in paragraphs[start_index:]:
             if is_style_heading(p):
                 break
             t = raw_text_of(p._p)
             num = _is_entry_line(t)
             if num is None:
-                num = list_numbers.get(start_index + offset)
+                label = self._automatic_number(p, list_counters)
+                if label is not None:
+                    num, t = label, f"{label}. {t}"
             if num is not None:
                 if num in entries:
                     self.warnings.append(
@@ -245,6 +231,43 @@ class ReferenceParser:
                 "text": entries[num],
             }
         return ref_map, self.warnings
+
+    @staticmethod
+    def _automatic_number(paragraph, counters):
+        """Read decimal Word list labels that are absent from paragraph text."""
+        ppr = paragraph._p.pPr
+        num_pr = ppr.find(qn("w:numPr")) if ppr is not None else None
+        if num_pr is None:
+            return None
+        num_id_el = num_pr.find(qn("w:numId"))
+        if num_id_el is None:
+            return None
+        num_id = num_id_el.get(qn("w:val"))
+        level_el = num_pr.find(qn("w:ilvl"))
+        ilvl = int(level_el.get(qn("w:val"), "0")) if level_el is not None else 0
+        numbering = paragraph.part.numbering_part.element
+        num = next((x for x in numbering.findall(qn("w:num"))
+                    if x.get(qn("w:numId")) == num_id), None)
+        if num is None:
+            return None
+        abstract_id = num.find(qn("w:abstractNumId"))
+        if abstract_id is None:
+            return None
+        abstract = next((x for x in numbering.findall(qn("w:abstractNum"))
+                         if x.get(qn("w:abstractNumId")) == abstract_id.get(qn("w:val"))), None)
+        level = None
+        if abstract is not None:
+            level = next((x for x in abstract.findall(qn("w:lvl"))
+                          if int(x.get(qn("w:ilvl"), "0")) == ilvl), None)
+        if level is None:
+            return None
+        fmt = level.find(qn("w:numFmt"))
+        if fmt is None or fmt.get(qn("w:val")) != "decimal":
+            return None
+        key = (num_id, ilvl)
+        start = level.find(qn("w:start"))
+        counters[key] = counters.get(key, int(start.get(qn("w:val"), "1")) - 1 if start is not None else 0) + 1
+        return counters[key]
 
 
 class _Block:

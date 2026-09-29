@@ -1,0 +1,4 @@
+# Everything main.py needs, plus the AI agent (agent.py). Needs Python 3.10+.
+#   pip install -r requirements-agent.txt
+-r requirements.txt
+google-genai>=2.25,<3

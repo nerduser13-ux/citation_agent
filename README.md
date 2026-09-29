@@ -27,6 +27,12 @@ authoritative number → source-URL mapping.
   footnotes (idempotency guard), while unrelated pre-existing footnotes never
   block new citations and are preserved verbatim.
 
+**AI agent (optional).** `python agent.py` starts a chat in which Google
+Gemini runs these tools for you ("add footnotes to my RALF essay", "check the
+links in my AI essay") and explains any problems in plain English. It can also
+check that every reference link works and leads to the paper it names. See
+[AI agent (chat with Gemini)](#ai-agent-chat-with-gemini).
+
 ---
 
 ## Folder structure
@@ -43,14 +49,18 @@ citation_agent/
 ├── word_footnotes.py      # surgical OOXML footnote insertion + experimental COM backend
 ├── validator.py           # input-unchanged + full post-save output validation
 ├── report.py              # citation_review_report.csv writer
-├── agent_tools.py         # narrow tool wrappers for a future AI agent
+├── agent_tools.py         # the AI agent's tools (Toolbox) + narrow pipeline wrappers
+├── agent.py               # AI agent: terminal chat, Google Gemini decides which tool to run
+├── link_checker.py        # does each reference link work / lead to that paper? (Crossref, ...)
 ├── requirements.txt
+├── requirements-agent.txt # requirements.txt + Google's Gemini SDK (for agent.py)
 ├── input/                 # drop your .docx here (or use --input)
 ├── output/                # generated files land here
 └── tests/
     ├── create_sample.py   # builds a realistic sample .docx (incl. a manual footnote)
     ├── validate_sample.py # deep checks of the sample output (OOXML level)
-    └── test_pipeline.py   # pytest end-to-end suite (48 tests)
+    ├── test_pipeline.py   # pytest end-to-end suite (48 tests)
+    └── test_agent.py      # agent, tools and link checker, fully offline (66 tests)
 ```
 
 ## Requirements
@@ -71,6 +81,9 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/pip install pytest
 ```
+
+For the AI agent (`agent.py`) use Python **3.10+** and install
+`requirements-agent.txt` instead (it includes `requirements.txt`).
 
 ## How to run
 
@@ -118,6 +131,121 @@ Missing URLs       : 1
 Ambiguous citations: 0
 Validation         : PASS
 ```
+
+## AI agent (chat with Gemini)
+
+`agent.py` lets you use the tool by chatting instead of typing commands.
+Google Gemini is the "brain": it understands what you ask, decides which tool
+to run and explains the results in plain English. The tools are the tested
+code of this project, so every guarantee above still holds: the AI cannot
+edit your documents itself, invent links or open other files.
+
+```
+You> add footnotes to my RALF essay
+  ... looking at your documents
+  ... adding footnotes to "RALF Reflective Professional Competency Account.docx"
+
+Agent> Done! I added 7 footnotes to your RALF document.
+- New file: RALF Reflective Professional Competency Account_with_footnotes.docx
+- Folder: output
+- Validation: passed - your original file was not changed.
+```
+
+Things you can ask, for example:
+
+* "add footnotes to my RALF essay" (or "... but keep the [n] numbers")
+* "check the links in my AI essay": does each link work and lead to that paper?
+* "what problems would there be in the AI document?" (a preview that saves nothing)
+* "why wasn't citation [7] turned into a footnote?"
+
+### Setup (once)
+
+1. **Python 3.10 or newer** (`main.py` on its own still works on 3.9).
+2. In the project folder, with the virtual environment active:
+   ```
+   pip install -r requirements-agent.txt
+   ```
+3. Get a **free Gemini API key** at <https://aistudio.google.com/apikey>:
+   sign in with a Google account and click *Create API key*. No credit card
+   is needed.
+
+### Start it
+
+```
+python agent.py
+```
+
+The first time, it asks for the key (paste it; it stays hidden) and offers to
+save it in `%USERPROFILE%\.citation_agent\` (`~/.citation_agent/` on
+macOS/Linux). That is **outside** the project folder, so the key can never be
+pushed to GitHub. Type `exit` to quit.
+
+| Option | Effect |
+| --- | --- |
+| `--once "check the links in my RALF essay"` | one question, one answer, then exit |
+| `--model gemini-3.8-flash` | use a specific model. Default `gemini-flash-latest`, Google's alias for its newest Flash model (or set `GEMINI_MODEL`) |
+| `--forget-key` | delete the saved key |
+| `--input-dir`, `--output-dir` | folders to use (default: `input/` and `output/` next to `agent.py`) |
+| `GEMINI_API_KEY` environment variable | used instead of the saved key |
+
+### The four tools the AI can use
+
+| Tool | What it does |
+| --- | --- |
+| `list_documents` | lists the `.docx` files in `input/` (and what is in `output/`) |
+| `analyze_document` | dry run: which citations would get footnotes, which have problems and why; saves nothing |
+| `add_footnotes` | the normal pipeline: new file in `output/`, original untouched, validated |
+| `check_links` | checks each reference link (below) |
+
+That is everything it can do. A document name from the AI is matched against
+the files that actually exist in `input/`, so nothing else can be reached, and
+the only file it can create is the pipeline's output.
+
+### Link checking
+
+`check_links` is also available without the AI:
+`python link_checker.py "input\My Essay.docx"`. For every reference link:
+
+* **DOI links** (`https://doi.org/10...`, or a DOI inside a publisher URL) are
+  checked against **Crossref**, the official DOI registry: the DOI must exist
+  and its registered title must match the reference. Publisher websites often
+  block automated checks; Crossref does not.
+* **ScienceDirect** (`/pii/...`) links are looked up at Crossref too, and
+  **PubMed Central** (`PMC...`) links at Europe PMC.
+* Any other link: the page or PDF is opened and its title compared.
+
+| Verdict | Meaning |
+| --- | --- |
+| `OK` | works, and the title matches the reference |
+| `CHECK` | works, but the title only partly matches or can't be read; compare it yourself |
+| `PROBLEM` | broken (not found, DOI doesn't exist, website gone) or leads to a **different paper** |
+| `UNVERIFIED` | couldn't be checked automatically (site blocks robots, timeout, offline); open it in a browser |
+| `NO_LINK` | the reference has no URL |
+
+Only registry data can say "different paper"; a website title that doesn't
+match is only `CHECK`. The checker never changes anything and never suggests
+replacement links.
+
+### Privacy and cost
+
+* Gemini receives your messages, file names, section headings, citation
+  markers, the **reference list** and the tools' results. It does **not**
+  receive the body text of your document.
+* On Gemini's **free tier, Google may use this content to improve its
+  products** (see the [pricing page](https://ai.google.dev/gemini-api/docs/pricing)).
+  Don't use the free tier for confidential documents.
+* The free tier has per-minute and per-day limits. If you hit one, the agent
+  tells you; wait a minute and try again.
+
+### Troubleshooting
+
+| Message | Fix |
+| --- | --- |
+| "didn't accept your API key" | create a new key, run `python agent.py --forget-key`, start again |
+| "free-tier limit" | wait a minute (or until tomorrow for the daily limit) |
+| "doesn't offer the model" | `python agent.py --model gemini-3.8-flash` |
+| "needs Google's Gemini package" | `pip install -r requirements-agent.txt` |
+| "needs Python 3.10 or newer" | install a newer Python from python.org |
 
 ## Citation syntax supported
 
@@ -320,7 +448,8 @@ backend is the validated default and is what the test suite exercises.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v                 # 48 end-to-end tests (OOXML-level)
+python -m pytest tests/ -v                 # 114 tests: 48 pipeline (OOXML-level)
+                                           #   + 66 agent / link checker (offline)
 python tests/create_sample.py              # (re)generate input/sample.docx
                                            #   (or: create_sample.py OUT.docx)
 python main.py                             # process the sample
@@ -342,6 +471,19 @@ heading; keyword-sentence false-positive avoidance; abort when no reference
 section; keep-marker mode; output-collision safe naming; `--overwrite`;
 output==input rejection; COM backend rejection on Linux; sample end-to-end
 (generated into a temp dir — running the suite never modifies tracked files).
+
+`tests/test_agent.py` runs **without internet or an API key**. A local fake
+server plays Crossref, Europe PMC, doi.org and ordinary websites (OK / partly
+matching / different paper / not found / robot check / 403 / PDF / redirect /
+offline), and another plays Gemini, driven through Google's real
+`google-genai` SDK. It covers: DOI/PII/PMCID extraction; title matching;
+every link verdict; the toolbox's file restrictions (path tricks, Word lock
+files, ambiguous names); previews that write nothing; footnotes via the
+agent with the original unchanged; problems explained; multi-step and
+parallel tool calls; Gemini 3 thought signatures sent back unchanged; tool
+errors returned to the model; API errors turned into advice with the
+conversation rolled back; the step limit; API-key handling. The Gemini tests
+are skipped when `google-genai` is not installed.
 
 Regression tests for issues found on real Word documents: runs carrying
 `w:lastRenderedPageBreak` (8 layouts × both modes, checked against an oracle
@@ -393,6 +535,26 @@ footnote**, one reference with **no URL** (reported unresolved), and one
 ## AI-agent design
 
 All deterministic work (reading the file, extracting URLs, matching numbers,
-insertion, validation) is plain Python and fully reproducible. The agent
-layer (`agent_tools.py`) only calls the explicit tools above and can never
-manipulate arbitrary files.
+insertion, validation, link checking) is plain Python and fully
+reproducible. The AI only decides *which* tool to call and explains the
+results:
+
+```
+you -> agent.py -> Gemini (decides) -> agent_tools.Toolbox -> main.run / link_checker
+                          ^------------- plain JSON results --------------'
+```
+
+* `agent_tools.Toolbox` is the entire interface: four tools with JSON inputs
+  and outputs. Errors come back as `{"error": ...}` so the model can explain
+  them instead of the chat crashing.
+* Documents are chosen by name from the listing of `input/`; a path from the
+  model is never opened.
+* Footnotes are only inserted by the deterministic pipeline, with its
+  validation. The model never touches document XML and cannot supply URLs.
+* The model's turns are sent back exactly as received, including Gemini 3
+  "thought signatures", which multi-step tool use requires.
+* `agent_tools.py` still offers the lower-level functions
+  (`inspect_document`, `find_reference_section`, ..., `run_pipeline`) for
+  other integrations. The planned Mendeley stage (identify publication ->
+  Mendeley reference -> Mendeley Cite citation) can be added as more tools in
+  the same way.

@@ -152,49 +152,165 @@ class CitationAgent:
 # --------------------------------------------------------------------------
 # Setup helpers
 # --------------------------------------------------------------------------
-def make_client(api_key, base_url=None):
+def make_client(api_key, base_url=None, retries=True):
     from google import genai
     from google.genai import types
+    retry = types.HttpRetryOptions(
+        attempts=4, initial_delay=2.0, max_delay=30.0,
+        http_status_codes=[429, 500, 502, 503, 504]) if retries else None
     return genai.Client(api_key=api_key, http_options=types.HttpOptions(
         base_url=base_url,
         timeout=180_000,                   # milliseconds
-        retry_options=types.HttpRetryOptions(
-            attempts=4, initial_delay=2.0, max_delay=30.0,
-            http_status_codes=[429, 500, 502, 503, 504]),
+        retry_options=retry,
     ))
 
 
-def get_api_key(interactive=True):
-    """Key from GEMINI_API_KEY / GOOGLE_API_KEY, else the saved key file,
-    else ask (hidden input) and offer to save it outside the project."""
+def is_key_error(exc):
+    """True if Gemini rejected the API key itself (mis-pasted, deleted,
+    blocked) - not for limits, outages or an unknown model name."""
+    try:
+        from google.genai import errors
+    except ImportError:          # pragma: no cover - checked in main()
+        return False
+    if not isinstance(exc, errors.APIError):
+        return False
+    code = exc.code or 0
+    blob = f"{exc.status} {exc.message} {exc.details}".lower()
+    if code == 401:              # "Request had invalid authentication credentials"
+        return True
+    return code in (400, 403) and any(
+        w in blob for w in ("api key", "api_key", "credential", "unregistered callers"))
+
+
+def key_problem(key):
+    """Why ``key`` can't be an API key ('' if it could be). Catches failed
+    pastes into the hidden prompt without assuming Google's key format
+    (new "auth keys" exist since 2026)."""
+    if not key:
+        return "nothing was pasted"
+    if any(ord(c) < 32 or c.isspace() for c in key):
+        return "it contains spaces or invisible characters, so the paste didn't work"
+    if len(key) < 20:
+        return f"it is only {len(key)} characters long"
+    return ""
+
+
+def mask(key):
+    """'AIza...x9Qk (39 characters)': enough to compare with AI Studio,
+    without printing the key."""
+    if len(key) >= 12:
+        return f"{key[:4]}...{key[-4:]} ({len(key)} characters)"
+    return f"({len(key)} characters)"
+
+
+def check_key(key, model=DEFAULT_MODEL):
+    """Ask Google whether it accepts ``key`` (a free metadata request).
+    (True, "") accepted - (False, reason) rejected - (None, reason) could not
+    tell right now (offline, busy)."""
+    # Keep a reference: google-genai closes its connection when the Client
+    # object is garbage-collected, even in the middle of a chained call.
+    client = make_client(key, retries=False)
+    try:
+        client.models.get(model=model)
+        return True, ""
+    except Exception as e:
+        if is_key_error(e):
+            return False, "Google didn't accept this key."
+        if getattr(e, "code", None) == 404:   # key accepted; model name is handled later
+            return True, ""
+        return None, friendly_error(e, model)
+
+
+def save_key(key):
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    KEY_FILE.write_text(key, encoding="utf-8")
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except OSError:
+        pass
+    print(f"Saved in {KEY_FILE} (outside the project, so it can't end up on GitHub).")
+
+
+def forget_key():
+    """Delete the saved key. True if there was one."""
+    if KEY_FILE.is_file():
+        KEY_FILE.unlink()
+        return True
+    return False
+
+
+def ask_for_key(model=DEFAULT_MODEL, intro=True, attempts=3):
+    """Hidden prompt for a key. Each key is checked with Google BEFORE it is
+    used or saved, so a wrong paste is never stored. Returns key or None."""
+    if intro:
+        print("To think, the agent uses Google Gemini, which needs a free API key.")
+        print("(On the free tier Google may use what the agent sends - your messages")
+        print(" and reference list, not your essay text - to improve its products.)")
+    print(f"  1. Open {KEY_URL} and sign in with a Google account")
+    print("  2. Click 'Create API key', then the copy button next to the new key")
+    for attempt in range(1, attempts + 1):
+        key = getpass.getpass("  3. Paste it here (Ctrl+V or right-click) and press "
+                              "Enter. It stays hidden: ").strip()
+        problem = key_problem(key)
+        if problem:
+            print(f"     That isn't a key: {problem}.")
+        else:
+            print(f"     Got {mask(key)}. Checking it with Google...", flush=True)
+            ok, reason = check_key(key, model)
+            if ok is not False:
+                print("     The key works." if ok else
+                      f"     Couldn't check it right now. {reason}")
+                answer = input("Save the key on this computer so you don't have to "
+                               "paste it again? [Y/n] ").strip().lower()
+                if answer in ("", "y", "yes"):
+                    save_key(key)
+                return key
+            print(f"     {reason} Copy the key itself (the long code), not its name "
+                  "or project, and check that its last 4 characters match AI Studio.")
+        if attempt < attempts:
+            print("     Please try again.")
+    print("No working key yet - start the agent again when you have one.")
+    return None
+
+
+def get_api_key(interactive=True, model=DEFAULT_MODEL):
+    """(key, source) with source "env", "file" or "typed"; (None, None) if
+    there is no key. A typed key has already been checked with Google."""
     for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
         if os.environ.get(var, "").strip():
-            return os.environ[var].strip()
+            return os.environ[var].strip(), "env"
     if KEY_FILE.is_file():
         key = KEY_FILE.read_text(encoding="utf-8").strip()
         if key:
-            return key
+            return key, "file"
     if not interactive:
-        return None
-    print("To think, the agent uses Google Gemini, which needs a free API key.")
-    print("(On the free tier Google may use what the agent sends - your messages")
-    print(" and reference list, not your essay text - to improve its products.)")
-    print(f"  1. Open {KEY_URL} and sign in with a Google account")
-    print("  2. Click 'Create API key' and copy it")
-    key = getpass.getpass("  3. Paste it here and press Enter (it stays hidden): ").strip()
+        return None, None
+    key = ask_for_key(model)
+    return (key, "typed") if key else (None, None)
+
+
+def replace_rejected_key(agent, source, model):
+    """Gemini rejected the key mid-chat: offer to paste a new one right away.
+    True if the agent now uses a new (checked) key."""
+    if source == "env":
+        print("\nGemini didn't accept the API key from the GEMINI_API_KEY (or "
+              "GOOGLE_API_KEY) environment variable. Change or remove it, then "
+              "start the agent again.")
+        return False
+    where = " saved on this computer" if source == "file" else ""
+    print(f"\nGemini didn't accept the API key{where}. It may have been pasted "
+          "wrongly, deleted or blocked.")
+    answer = input("Paste a new key now? [Y/n] ").strip().lower()
+    if answer not in ("", "y", "yes"):
+        print("OK. Later you can run:  python agent.py --forget-key")
+        return False
+    if forget_key():
+        print("Removed the old saved key.")
+    key = ask_for_key(model, intro=False)
     if not key:
-        return None
-    answer = input("Save the key on this computer so you don't have to paste it "
-                   "again? [Y/n] ").strip().lower()
-    if answer in ("", "y", "yes"):
-        KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        KEY_FILE.write_text(key, encoding="utf-8")
-        try:
-            os.chmod(KEY_FILE, 0o600)
-        except OSError:
-            pass
-        print(f"Saved in {KEY_FILE} (outside the project, so it can't end up on GitHub).")
-    return key
+        return False
+    agent.client = make_client(key)
+    return True
 
 
 def friendly_error(exc, model=DEFAULT_MODEL):
@@ -210,16 +326,17 @@ def friendly_error(exc, model=DEFAULT_MODEL):
         if code == 429:
             return ("You've reached Gemini's free-tier limit. Wait a minute and "
                     "try again (there is also a daily limit).")
-        if code in (400, 401, 403) and ("api key" in blob or "api_key" in blob):
-            return ("Gemini didn't accept your API key. Create a new one at "
-                    f"{KEY_URL}, then run:  python agent.py --forget-key  and "
-                    "start the agent again.")
+        if is_key_error(exc):
+            return ("Gemini didn't accept your API key (pasted wrongly, deleted "
+                    "or blocked). To enter a new one, run:  python agent.py "
+                    "--forget-key  and then start the agent again.")
+        if "location is not supported" in blob:
+            return "Gemini isn't available where you are (Google blocks some regions)."
         if code == 404:
             return (f"Gemini doesn't offer the model '{model}' to you. Try:  "
                     "python agent.py --model gemini-3.8-flash")
-        if code in (401, 403):
-            return (f"Gemini refused the request ({msg}). Check your API key, and "
-                    "that Gemini is available in your country.")
+        if code == 403:
+            return f"Gemini refused the request: {msg}"
         if code >= 500:
             return "Gemini is busy or having problems right now. Please try again shortly."
         return f"Gemini error {code}: {msg}"
@@ -282,9 +399,9 @@ def main(argv=None):
     except (AttributeError, ValueError):
         pass
     if args.forget_key:
-        if KEY_FILE.is_file():
-            KEY_FILE.unlink()
-            print(f"Deleted the saved key ({KEY_FILE}).")
+        if forget_key():
+            print(f"Deleted the saved key ({KEY_FILE}). Start the agent again to "
+                  "paste a new one.")
         else:
             print("No saved key found.")
         return 0
@@ -298,7 +415,8 @@ def main(argv=None):
               "    pip install -r requirements-agent.txt")
         return 2
 
-    key = get_api_key(interactive=sys.stdin.isatty() and not args.once)
+    key, source = get_api_key(interactive=sys.stdin.isatty() and not args.once,
+                              model=args.model)
     if not key:
         print(f"No API key. Get a free one at {KEY_URL} and start the agent again "
               "(or set the GEMINI_API_KEY environment variable).")
@@ -326,15 +444,22 @@ def main(argv=None):
             continue
         if text.lower() in ("exit", "quit", "bye", "q"):
             break
-        try:
-            answer = agent.ask(text)
-        except KeyboardInterrupt:
-            print("\n(stopped)")
-            continue
-        except Exception as e:
-            print("\n" + friendly_error(e, args.model))
-            continue
-        print("\nAgent> " + plain(answer))
+        for attempt in (1, 2):
+            try:
+                answer = agent.ask(text)
+            except KeyboardInterrupt:
+                print("\n(stopped)")
+                break
+            except Exception as e:
+                if attempt == 1 and is_key_error(e) and replace_rejected_key(
+                        agent, source, args.model):
+                    source = "file" if KEY_FILE.is_file() else "typed"
+                    print("Trying your message again...")
+                    continue
+                print("\n" + friendly_error(e, args.model))
+                break
+            print("\nAgent> " + plain(answer))
+            break
     print("Goodbye!")
     return 0
 

@@ -42,8 +42,9 @@ needs_genai = pytest.mark.skipif(
 # --------------------------------------------------------------------------
 class FakeServer:
     """GET: ``routes`` {path: (status, content_type, body[, headers]) or
-    callable(query) -> tuple}. POST: answered from ``post_script`` in order
-    (item = response dict, or (status, dict))."""
+    callable(query, headers) -> tuple}. POST: answered from ``post_script`` in
+    order (item = response dict, (status, dict), or callable(headers) -> one
+    of those)."""
 
     def __init__(self, routes=None, post_script=None):
         self.routes = routes or {}
@@ -70,7 +71,7 @@ class FakeServer:
                 server.gets.append(self.path)
                 route = server.routes.get(urllib.parse.unquote(parsed.path))
                 if callable(route):
-                    route = route(urllib.parse.parse_qs(parsed.query))
+                    route = route(urllib.parse.parse_qs(parsed.query), dict(self.headers))
                 if route is None:
                     return self._send(404, "text/plain", "not found")
                 self._send(*route)
@@ -84,6 +85,8 @@ class FakeServer:
                     return self._send(500, "application/json", {"error": {
                         "code": 500, "message": "script exhausted", "status": "INTERNAL"}})
                 item = server.post_script.pop(0)
+                if callable(item):
+                    item = item(dict(self.headers))
                 status, payload = item if isinstance(item, tuple) else (200, item)
                 self._send(status, "application/json", payload)
 
@@ -122,14 +125,14 @@ def crossref(title, subtitle=None):
     return (200, JSON, {"status": "ok", "message": rec})
 
 
-def _crossref_filter(query):
+def _crossref_filter(query, headers=None):
     if query.get("filter") == ["alternative-id:S2444569X25000320"]:
         return (200, JSON, {"message": {"items": [
             {"title": [AI_TITLE], "DOI": "10.1016/j.jik.2025.100687"}]}})
     return (200, JSON, {"message": {"items": []}})
 
 
-def _europepmc(query):
+def _europepmc(query, headers=None):
     if query.get("query") == ["PMCID:PMC12749562"]:
         return (200, JSON, {"hitCount": 1, "resultList": {"result": [
             {"title": AI_TITLE + ".", "pubYear": "2025", "doi": "10.1/x"}]}})
@@ -577,6 +580,9 @@ def test_tool_errors_go_back_to_the_model(box, gemini):
     (gemini_error(429, "RESOURCE_EXHAUSTED", "Resource has been exhausted"), "free-tier limit"),
     (gemini_error(400, "INVALID_ARGUMENT", "API key not valid. Please pass a valid API key.",
                   "API_KEY_INVALID"), "--forget-key"),
+    (gemini_error(401, "UNAUTHENTICATED", "Request had invalid authentication credentials. "
+                  "Expected OAuth 2 access token, login cookie or other valid authentication "
+                  "credential."), "--forget-key"),
     (gemini_error(404, "NOT_FOUND", "models/gemini-x is not found"), "--model"),
     (gemini_error(503, "UNAVAILABLE", "The model is overloaded."), "busy"),
 ])
@@ -645,12 +651,12 @@ def test_api_key_sources(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(agent, "KEY_FILE", key_file)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    assert agent.get_api_key(interactive=False) is None
+    assert agent.get_api_key(interactive=False) == (None, None)
     key_file.parent.mkdir()
     key_file.write_text("  saved-key\n", encoding="utf-8")
-    assert agent.get_api_key(interactive=False) == "saved-key"
+    assert agent.get_api_key(interactive=False) == ("saved-key", "file")
     monkeypatch.setenv("GEMINI_API_KEY", "env-key")
-    assert agent.get_api_key(interactive=False) == "env-key"
+    assert agent.get_api_key(interactive=False) == ("env-key", "env")
     assert agent.main(["--forget-key"]) == 0 and not key_file.exists()
     assert "Deleted" in capsys.readouterr().out
 
@@ -658,3 +664,146 @@ def test_api_key_sources(tmp_path, monkeypatch, capsys):
 def test_default_key_location_is_outside_the_project():
     import agent
     assert agent.HERE not in Path(agent.KEY_FILE).resolve().parents
+
+
+# --------------------------------------------------------------------------
+# API key entry and recovery
+# --------------------------------------------------------------------------
+GOOD_KEY = "GOOD-key-0123456789abcdefXYZ1"
+BAD_KEY = "BAD-key-0123456789abcdefXYZ22"
+
+
+def _models_get(query, headers):
+    """GET /v1beta/models/<model>: accepts only GOOD_KEY (like Google)."""
+    if headers.get("x-goog-api-key") == GOOD_KEY:
+        return (200, JSON, {"name": "models/gemini-flash-latest"})
+    return (401, JSON, {"error": {"code": 401, "status": "UNAUTHENTICATED", "message": (
+        "Request had invalid authentication credentials. Expected OAuth 2 access "
+        "token, login cookie or other valid authentication credential.")}})
+
+
+def _chat_reply(text):
+    """POST generateContent that answers ``text`` only for GOOD_KEY."""
+    def reply(headers):
+        if headers.get("x-goog-api-key") == GOOD_KEY:
+            return say(text)
+        return _models_get({}, headers)[::2]          # (401, error-json)
+    return reply
+
+
+class TTYInput(__import__("io").StringIO):
+    def isatty(self):
+        return True
+
+
+@pytest.fixture
+def keyenv(tmp_path, monkeypatch, gemini):
+    """Gemini fake + temp key file, no key in the environment."""
+    import agent
+    monkeypatch.setattr(agent, "KEY_FILE", tmp_path / "home" / "gemini_api_key.txt")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", gemini.base + "/")
+    gemini.routes["/v1beta/models/gemini-flash-latest"] = _models_get
+    return agent
+
+
+def _script_getpass(monkeypatch, agent, keys):
+    it = iter(keys)
+    monkeypatch.setattr(agent.getpass, "getpass", lambda prompt="": next(it))
+
+
+def test_key_problem_and_mask():
+    import agent
+    assert agent.key_problem("") == "nothing was pasted"
+    assert "didn't work" in agent.key_problem("\x16")          # Ctrl+V as a character
+    assert "didn't work" in agent.key_problem("AIza123 456789012345678")
+    assert "only 9 characters" in agent.key_problem("123456789")
+    assert agent.key_problem(GOOD_KEY) == ""
+    assert agent.mask(GOOD_KEY) == "GOOD...XYZ1 (29 characters)"
+    assert GOOD_KEY not in agent.mask(GOOD_KEY)
+    assert agent.mask("short") == "(5 characters)"
+
+
+@needs_genai
+def test_check_key(keyenv, gemini):
+    agent = keyenv
+    assert agent.check_key(GOOD_KEY) == (True, "")
+    ok, reason = agent.check_key(BAD_KEY)
+    assert ok is False and "didn't accept" in reason
+    gemini.routes["/v1beta/models/gemini-x"] = (404, JSON, {"error": {
+        "code": 404, "status": "NOT_FOUND", "message": "models/gemini-x is not found"}})
+    assert agent.check_key(GOOD_KEY, model="gemini-x") == (True, "")   # key is fine
+    gemini.routes["/v1beta/models/gemini-y"] = (503, JSON, {"error": {
+        "code": 503, "status": "UNAVAILABLE", "message": "overloaded"}})
+    ok, reason = agent.check_key(GOOD_KEY, model="gemini-y")
+    assert ok is None and "busy" in reason
+
+
+@needs_genai
+def test_bad_pastes_are_rejected_and_only_a_working_key_is_saved(keyenv, monkeypatch, capsys):
+    agent = keyenv
+    _script_getpass(monkeypatch, agent, ["\x16", BAD_KEY, GOOD_KEY])
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    assert agent.get_api_key(interactive=True) == (GOOD_KEY, "typed")
+    out = capsys.readouterr().out
+    assert "That isn't a key" in out                       # failed Ctrl+V
+    assert "Google didn't accept this key" in out          # wrong key, never saved
+    assert "Got GOOD...XYZ1 (29 characters)" in out and "The key works." in out
+    assert GOOD_KEY not in out and BAD_KEY not in out      # keys are never printed
+    assert agent.KEY_FILE.read_text(encoding="utf-8") == GOOD_KEY
+
+
+@needs_genai
+def test_three_wrong_keys_give_up_without_saving(keyenv, monkeypatch, capsys):
+    agent = keyenv
+    _script_getpass(monkeypatch, agent, [BAD_KEY, "", BAD_KEY])
+    assert agent.get_api_key(interactive=True) == (None, None)
+    assert "No working key yet" in capsys.readouterr().out
+    assert not agent.KEY_FILE.exists()
+
+
+@needs_genai
+def test_rejected_saved_key_is_replaced_in_the_chat(keyenv, gemini, box, monkeypatch, capsys):
+    agent = keyenv
+    agent.KEY_FILE.parent.mkdir(parents=True)
+    agent.KEY_FILE.write_text(BAD_KEY, encoding="utf-8")   # the user's mistake
+    gemini.post_script = [_chat_reply("Hi there!"), _chat_reply("Hi there!")]
+    _script_getpass(monkeypatch, agent, [GOOD_KEY])
+    # "hey" -> 401 -> "Paste a new key now?" y -> paste -> "Save?" y -> retried
+    monkeypatch.setattr(sys, "stdin", TTYInput("hey\ny\ny\nexit\n"))
+    code = agent.main(["--input-dir", str(box.input_dir), "--output-dir", str(box.output_dir)])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "didn't accept the API key saved on this computer" in out
+    assert "Removed the old saved key." in out and "The key works." in out
+    assert "Trying your message again..." in out and "Agent> Hi there!" in out
+    assert agent.KEY_FILE.read_text(encoding="utf-8") == GOOD_KEY
+    assert [p["headers"]["x-goog-api-key"] for p in gemini.posts] == [BAD_KEY, GOOD_KEY]
+
+
+@needs_genai
+def test_declining_a_new_key_keeps_the_chat_going(keyenv, gemini, box, monkeypatch, capsys):
+    agent = keyenv
+    agent.KEY_FILE.parent.mkdir(parents=True)
+    agent.KEY_FILE.write_text(BAD_KEY, encoding="utf-8")
+    gemini.post_script = [_chat_reply("unused")]
+    monkeypatch.setattr(sys, "stdin", TTYInput("hey\nn\nexit\n"))
+    assert agent.main(["--input-dir", str(box.input_dir),
+                       "--output-dir", str(box.output_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "--forget-key" in out and "Goodbye!" in out
+    assert agent.KEY_FILE.read_text(encoding="utf-8") == BAD_KEY   # user said no
+
+
+@needs_genai
+def test_rejected_environment_key_explains_instead_of_prompting(keyenv, gemini, box,
+                                                                 monkeypatch, capsys):
+    agent = keyenv
+    monkeypatch.setenv("GEMINI_API_KEY", BAD_KEY)
+    gemini.post_script = [_chat_reply("unused")]
+    monkeypatch.setattr(sys, "stdin", TTYInput("hey\nexit\n"))
+    assert agent.main(["--input-dir", str(box.input_dir),
+                       "--output-dir", str(box.output_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "environment variable" in out and "Paste a new key now?" not in out

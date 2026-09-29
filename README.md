@@ -175,10 +175,18 @@ Things you can ask, for example:
 python agent.py
 ```
 
-The first time, it asks for the key (paste it; it stays hidden) and offers to
-save it in `%USERPROFILE%\.citation_agent\` (`~/.citation_agent/` on
-macOS/Linux). That is **outside** the project folder, so the key can never be
-pushed to GitHub. Type `exit` to quit.
+The first time, it asks for the key. Paste it with Ctrl+V or a right-click.
+It stays hidden, but you then see a masked preview such as
+`AIza...x9Qk (39 characters)`, so you know the paste worked. The agent
+**checks the key with Google before using or saving it**, so a wrong paste is
+never stored. It then offers to save the key in `%USERPROFILE%\.citation_agent\`
+(`~/.citation_agent/` on macOS/Linux). That is **outside** the project folder,
+so the key can never be pushed to GitHub. Type `exit` to quit.
+
+**Wrong or old key?** If Gemini rejects the saved key during a chat, the agent
+offers to paste a new one on the spot and then retries your message. To
+replace a key yourself, run `python agent.py --forget-key` (or delete
+`%USERPROFILE%\.citation_agent\gemini_api_key.txt`) and start the agent again.
 
 | Option | Effect |
 | --- | --- |
@@ -241,7 +249,9 @@ replacement links.
 
 | Message | Fix |
 | --- | --- |
-| "didn't accept your API key" | create a new key, run `python agent.py --forget-key`, start again |
+| "didn't accept your API key" | the agent offers to paste a new key. Copy the key itself with the copy button in AI Studio, not its name or project. Or run `python agent.py --forget-key` and start again |
+| "That isn't a key: ... the paste didn't work" | paste again: Ctrl+V or a right-click in the Command Prompt window |
+| an old key stopped working | since May 28, 2026, AI Studio creates "auth keys" and the Gemini API rejects old *unrestricted* keys, so create a new key |
 | "free-tier limit" | wait a minute (or until tomorrow for the daily limit) |
 | "doesn't offer the model" | `python agent.py --model gemini-3.8-flash` |
 | "needs Google's Gemini package" | `pip install -r requirements-agent.txt` |

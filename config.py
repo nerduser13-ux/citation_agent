@@ -15,26 +15,31 @@ class Config:
 
     # --- Footnote backend -----------------------------------------------------
     # "xml"  -> cross-platform OOXML manipulation (default, validated here)
-    # "com"  -> Windows Microsoft Word COM automation (experimental, untested on Linux)
+    # "com"  -> Windows Microsoft Word COM automation (experimental)
     backend: str = "xml"
 
-    # --- Marker handling -----------------------------------------------------
-    # True  -> the [n] marker is REPLACED by the Word footnote reference marker
-    #          (the [n] disappears, as required by the spec).
-    # False -> the [n] marker is KEPT and a footnote reference is inserted after it.
+    # --- Marker handling ------------------------------------------------------
+    # True  -> the [n] marker is REPLACED by the Word footnote reference marker.
+    # False -> the [n] marker is KEPT and the footnote reference is inserted
+    #          immediately AFTER it (the [n] text survives).
     replace_marker: bool = True
 
     # If the resolved output file already exists, create a safe alternative
     # (e.g. document_with_footnotes_1.docx) unless this is True.
     overwrite_output: bool = False
 
-    # --- Reference-section detection -----------------------------------------
+    # --- Reference-section detection ------------------------------------------
+    # Keyword phrases a reference-section heading may consist of (case-insensitive).
     reference_keywords: tuple = (
-        "references", "bibliography", "works cited",
+        "references", "reference", "bibliography", "works cited",
         "reference list", "literature cited", "sources",
     )
-    min_reference_entries: int = 3   # fallback block-detection thresholds
-    min_reference_urls: int = 1
+    # Fallback "numbered block near the end of the document" thresholds.
+    min_reference_entries: int = 3   # minimum numbered entries in a candidate block
+    min_reference_urls: int = 1      # minimum URLs found in entry lines of a block
+    block_start_fraction: float = 0.40
+    # A candidate block must start no earlier than this fraction of the way through
+    # the document's paragraph list (references are near the end, by convention).
 
     def resolve_output_path(self):
         """Return a safe output path, never overwriting the input or an existing
@@ -44,6 +49,10 @@ class Config:
             out = Path(self.output_path)
         else:
             out = self.output_dir / (src.stem + "_with_footnotes" + src.suffix)
+        if out.resolve() == src.resolve():
+            raise ValueError(
+                "Output path is identical to the input path; refusing to touch the "
+                "original file. Choose a different --output (or use the default).")
         if out.exists() and not self.overwrite_output:
             i = 1
             while True:

@@ -1,22 +1,27 @@
 Citation Number,Location,Citation Text,Reference Text,URL,Action,Status,Notes
-1,Paragraph 3 (1. Introduction),[1],1. Author A. Title one. Journal. 2020. https://example.com/one,https://example.com/one,Footnote inserted,SUCCESS,Inline citation
-2,Paragraph 3 (1. Introduction),[2],2. Author B. Title two. Journal. 2021. https://example.com/two,https://example.com/two,Footnote inserted,SUCCESS,Inline citation
-3,Paragraph 3 (1. Introduction),[3],3. Author C. Title three. https://doi.org/10.1000/three,https://doi.org/10.1000/three,Footnote inserted,SUCCESS,Inline citation
-2,Paragraph 3 (1. Introduction),[2],2. Author B. Title two. Journal. 2021. https://example.com/two,https://example.com/two,Footnote inserted,SUCCESS,Inline citation
-4,Paragraph 5 (2. Background),[4]-[6],4. Author D. Title four. https://example.com/four,https://example.com/four,Footnote inserted,SUCCESS,Range expanded
-5,Paragraph 5 (2. Background),[4]-[6],5. Author E. Title five. https://example.com/five,https://example.com/five,Footnote inserted,SUCCESS,Range expanded
-6,Paragraph 5 (2. Background),[4]-[6],6. Author F. Title six. https://example.com/six,https://example.com/six,Footnote inserted,SUCCESS,Range expanded
-7,Paragraph 5 (2. Background),[7],7. Author G. Title seven. https://example.com/seven,https://example.com/seven,Footnote inserted,SUCCESS,Inline citation
-8,Paragraph 5 (2. Background),[8],8. Author H. Title eight. https://example.com/eight,https://example.com/eight,Footnote inserted,SUCCESS,Inline citation
-1,Paragraph 5 (2. Background),[1],1. Author A. Title one. Journal. 2020. https://example.com/one,https://example.com/one,Footnote inserted,SUCCESS,Inline citation
-9,Paragraph 7 (3. Methods),[9],9. Author I. Title nine. https://example.com/nine,https://example.com/nine,Footnote inserted,SUCCESS,Inline citation
+1,para 3 (body); section: 1. Introduction,[1],1. Author A. Title one. Journal. 2020. https://example.com/one,https://example.com/one,Footnote inserted,SUCCESS,Inline citation
+2,para 3 (body); section: 1. Introduction,[2],2. Author B. Title two. Journal. 2021. https://example.com/two,https://example.com/two,Footnote inserted,SUCCESS,Inline citation
+3,para 3 (body); section: 1. Introduction,[3],3. Author C. Title three. https://doi.org/10.1000/three,https://doi.org/10.1000/three,Footnote inserted,SUCCESS,Inline citation
+2,para 3 (body); section: 1. Introduction,[2],2. Author B. Title two. Journal. 2021. https://example.com/two,https://example.com/two,Footnote inserted,SUCCESS,Inline citation
+4,para 5 (body); section: 2. Background,[4]-[6],4. Author D. Title four. https://example.com/four,https://example.com/four,Footnote inserted,SUCCESS,Range expanded
+5,para 5 (body); section: 2. Background,[4]-[6],5. Author E. Title five. https://example.com/five,https://example.com/five,Footnote inserted,SUCCESS,Range expanded
+6,para 5 (body); section: 2. Background,[4]-[6],6. Author F. Title six. https://example.com/six,https://example.com/six,Footnote inserted,SUCCESS,Range expanded
+7,para 5 (body); section: 2. Background,[7],7. Author G. Title seven. https://example.com/seven,https://example.com/seven,Footnote inserted,SUCCESS,Inline citation
+8,para 5 (body); section: 2. Background,[8],8. Author H. Title eight. https://example.com/eight,https://example.com/eight,Footnote inserted,SUCCESS,Inline citation
+1,para 5 (body); section: 2. Background,[1],1. Author A. Title one. Journal. 2020. https://example.com/one,https://example.com/one,Footnote inserted,SUCCESS,Inline citation
+9,para 7 (table r1c1); section: 3. Methods,[9],9. Author I. Title nine. https://example.com/nine,https://example.com/nine,Footnote inserted,SUCCESS,Inline citation
 
 SUMMARY
+Input,input/sample.docx
+Output,output/sample_with_footnotes.docx
+Reference_section,"FOUND (heading, high)"
+Reference_section_method,heading
+Reference_section_confidence,high
 References_detected,11
 URLs_detected,10
 Citation_markers_detected,9
 Footnotes_inserted,11
-Existing_footnotes_detected,0
+Existing_footnotes_detected,1
 Existing_footnotes_preserved,True
 Unresolved_citations,0
 Missing_URLs,10
@@ -27,3 +32,4 @@ Output_valid_docx,True
 Reopened_with_python_docx,True
 All_footnote_URLs_from_refs,True
 Input_unchanged,True
+Status,OK

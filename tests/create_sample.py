@@ -2,20 +2,37 @@
 
 The sample intentionally includes:
   * a heading-based reference section ("References", not "5. References")
-  * inline citations, multiple citations and a range ([4]-[6])
+  * inline citations, multiple citations, repeated numbers and a range ([4]-[6])
   * a citation inside a bold run (formatting preservation)
   * a real hyperlink (must be preserved, not touched)
   * a citation inside a table cell
+  * a PRE-EXISTING manual footnote in the introduction (must be preserved)
   * one reference with NO url (-> reported as missing URL)
   * one reference that is never cited (-> reported as uncited)
 """
 from pathlib import Path
+
+from lxml import etree
 from docx import Document
-from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.opc.packuri import PackURI
+from docx.opc.part import Part
 
 OUT = Path(__file__).resolve().parent.parent / "input" / "sample.docx"
+
+FOOTNOTES_CT = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml")
+FOOTNOTES_TEMPLATE = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<w:footnotes '
+    'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+    '<w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>'
+    '<w:footnote w:type="continuationSeparator" w:id="0">'
+    '<w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>'
+    "</w:footnotes>")
 
 
 def add_hyperlink(paragraph, url, text):
@@ -31,15 +48,47 @@ def add_hyperlink(paragraph, url, text):
     paragraph._p.append(hyperlink)
 
 
+def add_preexisting_footnote(doc, paragraph, text):
+    """Add a genuine manual footnote (id=1) to ``paragraph`` so the sample
+    already contains footnote infrastructure the tool must preserve."""
+    part = Part(PackURI("/word/footnotes.xml"), FOOTNOTES_CT,
+                FOOTNOTES_TEMPLATE.encode("utf-8"), doc.part.package)
+    doc.part.relate_to(part, RT.FOOTNOTES)
+    root = etree.fromstring(FOOTNOTES_TEMPLATE.encode("utf-8"))
+    ft = OxmlElement("w:footnote")
+    ft.set(qn("w:id"), "1")
+    p = OxmlElement("w:p")
+    r = OxmlElement("w:r")
+    r.append(OxmlElement("w:footnoteRef"))
+    p.append(r)
+    r2 = OxmlElement("w:r")
+    t2 = OxmlElement("w:t")
+    t2.text = text
+    r2.append(t2)
+    p.append(r2)
+    ft.append(p)
+    root.append(ft)
+    part._blob = etree.tostring(
+        root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    # body reference run
+    run = OxmlElement("w:r")
+    fr = OxmlElement("w:footnoteReference")
+    fr.set(qn("w:id"), "1")
+    run.append(fr)
+    paragraph._p.append(run)
+
+
 def main():
     doc = Document()
 
     doc.add_paragraph("Sample Academic Paper").runs[0].bold = True
 
     doc.add_heading("1. Introduction", level=1)
-    doc.add_paragraph(
+    p = doc.add_paragraph(
         "Climate research has grown rapidly [1]. Related work is also relevant "
         "[2] and [3]. See this very important [2] point restated.")
+    add_preexisting_footnote(
+        doc, p, "This footnote already existed in the source document.")
 
     doc.add_heading("2. Background", level=1)
     p = doc.add_paragraph()

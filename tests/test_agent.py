@@ -43,8 +43,8 @@ needs_genai = pytest.mark.skipif(
 class FakeServer:
     """GET: ``routes`` {path: (status, content_type, body[, headers]) or
     callable(query, headers) -> tuple}. POST: answered from ``post_script`` in
-    order (item = response dict, (status, dict), or callable(headers) -> one
-    of those)."""
+    order (item = response dict, (status, dict[, headers]), or
+    callable(headers) -> one of those)."""
 
     def __init__(self, routes=None, post_script=None):
         self.routes = routes or {}
@@ -87,8 +87,8 @@ class FakeServer:
                 item = server.post_script.pop(0)
                 if callable(item):
                     item = item(dict(self.headers))
-                status, payload = item if isinstance(item, tuple) else (200, item)
-                self._send(status, "application/json", payload)
+                status, payload, *extra = item if isinstance(item, tuple) else (200, item)
+                self._send(status, "application/json", payload, *extra)
 
             def log_message(self, *args):
                 pass
@@ -807,3 +807,509 @@ def test_rejected_environment_key_explains_instead_of_prompting(keyenv, gemini, 
                        "--output-dir", str(box.output_dir)]) == 0
     out = capsys.readouterr().out
     assert "environment variable" in out and "Paste a new key now?" not in out
+
+
+# --------------------------------------------------------------------------
+# Other free AIs: Groq, OpenRouter, Mistral (OpenAI format) and Ollama
+# --------------------------------------------------------------------------
+import llm_providers                                         # noqa: E402
+from llm_providers import PROVIDERS, ChatClient, ProviderError  # noqa: E402
+
+
+def oa_calls(*calls):
+    """An OpenAI-style assistant turn with tool calls: oa_calls(("name", {args}, "id"), ...)."""
+    tool_calls = []
+    for i, call in enumerate(calls):
+        name, args, cid = (tuple(call) + (None, None))[:3]
+        tool_calls.append({"id": cid or f"call_{i}", "type": "function",
+                           "function": {"name": name, "arguments": json.dumps(args or {})}})
+    return {"id": "chatcmpl-1", "object": "chat.completion", "model": "m", "choices": [
+        {"index": 0, "finish_reason": "tool_calls",
+         "message": {"role": "assistant", "content": None, "tool_calls": tool_calls}}]}
+
+
+def oa_say(text):
+    return {"choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": text}}]}
+
+
+def oa_error(status, message, code=None, headers=None):
+    err = {"message": message, "type": "invalid_request_error"}
+    if code:
+        err["code"] = code
+    return (status, {"error": err}, headers or {})
+
+
+def ol_calls(*calls):
+    """An Ollama /api/chat answer with tool calls (arguments are objects, no ids)."""
+    return {"model": "qwen3:8b", "done": True, "done_reason": "stop", "message": {
+        "role": "assistant", "content": "",
+        "tool_calls": [{"function": {"index": i, "name": name, "arguments": args}}
+                       for i, (name, args) in enumerate(calls)]}}
+
+
+def ol_say(text):
+    return {"model": "qwen3:8b", "done": True, "done_reason": "stop",
+            "message": {"role": "assistant", "content": text}}
+
+
+ROOT_PATH = {"gemini": "", "groq": "/openai/v1", "openrouter": "/api/v1",
+             "mistral": "/v1", "ollama": ""}
+DAILY_429 = ("Rate limit reached for model `openai/gpt-oss-120b` in organization `org_1` "
+             "service tier `on_demand` on requests per day (RPD): Limit 1000, Used 1000, "
+             "Requested 1. Please try again in 1m26.4s.")
+
+
+@pytest.fixture
+def llm():
+    srv = FakeServer()
+    yield srv
+    srv.close()
+
+
+@pytest.fixture
+def clean(tmp_path, monkeypatch):
+    """No real keys, models or addresses from the developer's environment;
+    keys are saved in a temp folder."""
+    import agent
+    monkeypatch.setattr(agent, "KEY_FILE", tmp_path / "home" / "gemini_api_key.txt")
+    for p in PROVIDERS.values():
+        for var in p.key_envs + (p.model_env, p.base_url_env):
+            if var:
+                monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("GOOGLE_GEMINI_BASE_URL", raising=False)
+    return agent
+
+
+def _point(monkeypatch, provider, srv):
+    """Send ``provider``'s requests to the fake server."""
+    monkeypatch.setenv(PROVIDERS[provider].base_url_env, srv.base + ROOT_PATH[provider])
+
+
+def _chat_agent(box, srv, provider="groq", key="test-key", sleep=None, on_wait=None, **kw):
+    import agent
+    p = PROVIDERS[provider]
+    client = ChatClient(p, key, base_url=srv.base + ROOT_PATH[provider],
+                        sleep=sleep or (lambda s: None), on_wait=on_wait)
+    return agent.ChatAgent(client, box, model=kw.pop("model", p.default_model), **kw)
+
+
+def test_chat_agent_uses_tools_and_answers(box, llm):
+    llm.post_script = [oa_calls(("list_documents", {}, "c1")),
+                       oa_calls(("add_footnotes", {"name": "essay"}, "c2")),
+                       oa_say("Done! 3 footnotes added.")]
+    seen = []
+    bot = _chat_agent(box, llm, on_tool=lambda name, args: seen.append((name, args)))
+    assert bot.ask("please add footnotes to my essay") == "Done! 3 footnotes added."
+    assert seen == [("list_documents", {}), ("add_footnotes", {"name": "essay"})]
+    assert (box.output_dir / "My Essay_with_footnotes.docx").is_file()
+
+    first = llm.posts[0]
+    assert first["path"] == "/openai/v1/chat/completions"
+    assert first["headers"]["Authorization"] == "Bearer test-key"
+    body = first["body"]
+    assert body["model"] == "openai/gpt-oss-120b" and body["reasoning_effort"] == "low"
+    assert body["max_completion_tokens"] == llm_providers.GROQ_MAX_OUTPUT
+    assert body["messages"][0]["role"] == "system"
+    assert "Never invent" in body["messages"][0]["content"]
+    assert [t["function"]["name"] for t in body["tools"]] == [
+        "list_documents", "analyze_document", "add_footnotes", "check_links"]
+    assert body["tools"][0]["function"]["parameters"] == {"type": "object", "properties": {}}
+
+    msgs = llm.posts[2]["body"]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool",
+                                         "assistant", "tool"]
+    assert msgs[4]["tool_calls"][0]["id"] == "c2" and msgs[4]["content"] is None
+    assert msgs[5]["tool_call_id"] == "c2" and msgs[5]["name"] == "add_footnotes"
+    result = json.loads(msgs[5]["content"])
+    assert result["footnotes_added"] == 3 and result["validation"] == "PASS"
+    assert len(bot.history) == 6
+
+
+def test_chat_agent_parallel_calls_bad_arguments_and_thinking(box, llm):
+    llm.post_script = [
+        {"choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": "", "tool_calls": [
+                {"id": "a", "type": "function",
+                 "function": {"name": "list_documents", "arguments": "null"}},
+                {"id": "b", "type": "function",
+                 "function": {"name": "analyze_document", "arguments": "{\"name\": \"Report\"}"}},
+                {"id": "c", "type": "function",
+                 "function": {"name": "analyze_document", "arguments": "{not json"}}]}}]},
+        oa_say("<think>which one?</think>ok"),
+    ]
+    bot = _chat_agent(box, llm, provider="openrouter")
+    assert bot.ask("what do I have?") == "ok"               # thinking is not shown
+    assert llm.posts[0]["path"] == "/api/v1/chat/completions"
+    assert "reasoning_effort" not in llm.posts[0]["body"]
+    assert "max_completion_tokens" not in llm.posts[0]["body"]
+    tools = [m for m in llm.posts[1]["body"]["messages"] if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in tools] == ["a", "b", "c"]
+    assert json.loads(tools[0]["content"])["documents"] == ["My Essay.docx", "Report.docx"]
+    assert json.loads(tools[1]["content"])["citations_found"] == 1
+    assert "not a valid JSON" in json.loads(tools[2]["content"])["error"]
+
+
+def test_ollama_uses_its_own_api_with_a_big_enough_context(box, llm):
+    llm.post_script = [ol_calls(("add_footnotes", {"name": "Report"})), ol_say("All done.")]
+    bot = _chat_agent(box, llm, provider="ollama", key="")
+    assert bot.ask("footnotes for Report") == "All done."
+    first = llm.posts[0]
+    assert first["path"] == "/api/chat" and "Authorization" not in first["headers"]
+    assert first["body"]["stream"] is False
+    assert first["body"]["options"]["num_ctx"] == llm_providers.OLLAMA_NUM_CTX
+    msgs = llm.posts[1]["body"]["messages"]
+    assert msgs[2]["tool_calls"][0]["function"]["arguments"] == {"name": "Report"}
+    assert msgs[3]["role"] == "tool" and msgs[3]["tool_name"] == "add_footnotes"
+    assert json.loads(msgs[3]["content"])["validation"] == "PASS"
+    assert bot.history[1]["tool_calls"][0]["id"]             # an id was made up
+
+
+def test_per_minute_limit_is_waited_for_then_retried(box, llm):
+    waits, slept = [], []
+    llm.post_script = [
+        oa_error(429, "Rate limit reached ... on tokens per minute (TPM): Limit 8000. "
+                 "Please try again in 7.66s.", "rate_limit_exceeded", {"retry-after": "8"}),
+        oa_error(429, "Rate limit reached ... Please try again in 2.5s.", "rate_limit_exceeded"),
+        oa_say("hi"),
+    ]
+    bot = _chat_agent(box, llm, sleep=slept.append,
+                      on_wait=lambda p, seconds, e: waits.append((p.id, seconds)))
+    assert bot.ask("hello") == "hi"
+    assert waits == [("groq", 8.5), ("groq", 3.0)] and slept == [8.5, 3.0]
+
+
+@pytest.mark.parametrize("provider, error, advice", [
+    ("groq", oa_error(401, "Invalid API Key", "invalid_api_key"),
+     "python agent.py --provider groq --forget-key"),
+    ("groq", oa_error(429, DAILY_429, "rate_limit_exceeded"), "free requests for today"),
+    ("groq", oa_error(404, "The model `x` does not exist or you do not have access to it.",
+                      "model_not_found"), "--provider groq --model openai/gpt-oss-120b"),
+    ("groq", oa_error(413, "Request too large for model `openai/gpt-oss-120b` on tokens per "
+                      "minute (TPM): Limit 8000, Requested 9500"), "too much text"),
+    ("openrouter", (404, {"error": {"code": 404, "message": (
+        "No endpoints found matching your data policy (Free model training). Configure: "
+        "https://openrouter.ai/settings/privacy")}}), "openrouter.ai/settings/privacy"),
+    ("openrouter", (404, {"error": {"code": 404, "message":
+                                    "No endpoints found that support tool use."}}),
+     "can't use tools"),
+    ("openrouter", (402, {"error": {"code": 402, "message": "Insufficient credits"}}),
+     "no credit left"),
+    ("mistral", (400, {"object": "error", "message": "Invalid model: mistral-x",
+                       "type": "invalid_model"}), "--provider mistral --model mistral-small"),
+    ("mistral", (401, {"message": "Unauthorized", "request_id": "r1"}), "--forget-key"),
+    ("ollama", (404, {"error": "model \"qwen3:8b\" not found, try pulling it first"}),
+     "ollama pull qwen3:8b"),
+    ("ollama", (400, {"error": "registry.ollama.ai/library/gemma3:4b does not support tools"}),
+     "can't use tools"),
+])
+def test_provider_errors_become_advice_and_roll_back(box, llm, provider, error, advice):
+    import agent
+    llm.post_script = [error]
+    bot = _chat_agent(box, llm, provider=provider)
+    with pytest.raises(ProviderError) as exc:
+        bot.ask("hello")
+    assert advice in agent.friendly_error(exc.value, bot.model, provider)
+    assert bot.history == []                               # conversation still valid
+    assert len(llm.posts) == 1                             # not retried
+    assert agent.is_key_error(exc.value) == (error[0] == 401)
+
+
+def test_busy_service_is_retried_then_explained(box, llm):
+    import agent
+    llm.post_script = [(503, {"message": "Service unavailable"})] * 4
+    slept = []
+    bot = _chat_agent(box, llm, provider="mistral", sleep=slept.append)
+    with pytest.raises(ProviderError) as exc:
+        bot.ask("hello")
+    assert slept == [2, 5, 10] and len(llm.posts) == 4
+    assert "busy" in agent.friendly_error(exc.value, bot.model, "mistral")
+    assert agent.is_limit_error(exc.value)
+
+
+def test_network_problems_are_explained(box):
+    import agent
+    port = _closed_port()
+    for provider, advice in [("groq", "internet"), ("ollama", "Ollama isn't running")]:
+        client = ChatClient(PROVIDERS[provider], "k", base_url=f"http://127.0.0.1:{port}",
+                            sleep=lambda s: None)
+        bot = agent.ChatAgent(client, box, model="m")
+        with pytest.raises(ProviderError) as exc:
+            bot.ask("hello")
+        assert exc.value.network and advice in agent.friendly_error(exc.value, "m", provider)
+
+
+def test_error_details_are_understood(monkeypatch):
+    assert llm_providers._seconds("1m26.4s") == pytest.approx(86.4)
+    assert llm_providers._seconds("500ms") == pytest.approx(0.5)
+    e = llm_providers.error_from_http("groq", 429, json.dumps(
+        {"error": {"message": "Please try again in 1m26.4s."}}).encode())
+    assert e.retry_after == pytest.approx(86.4) and llm_providers.is_daily_limit(e)
+    e = llm_providers.error_from_http("openrouter", 429, json.dumps({"error": {
+        "code": 429, "message": "Provider returned error",
+        "metadata": {"raw": "upstream is rate-limited"}}}).encode())
+    assert "upstream is rate-limited" in e.message and not llm_providers.is_daily_limit(e)
+    monkeypatch.setenv("OLLAMA_HOST", "0.0.0.0")
+    assert llm_providers.base_url_for(PROVIDERS["ollama"]) == "http://127.0.0.1:11434"
+    monkeypatch.setenv("OLLAMA_HOST", "otherpc:12345")
+    assert llm_providers.base_url_for(PROVIDERS["ollama"]) == "http://otherpc:12345"
+
+
+def test_errors_reported_with_status_200_are_errors(box, llm):
+    llm.post_script = [{"error": {"code": 502, "message": "Upstream error"}}] * 4
+    with pytest.raises(ProviderError) as exc:
+        _chat_agent(box, llm, provider="openrouter").ask("hello")
+    assert exc.value.status == 502
+
+
+def _msgs_for_exchange(n, big):
+    return [{"role": "user", "content": f"q{n}"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": f"t{n}", "type": "function",
+                "function": {"name": "list_documents", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": f"t{n}", "name": "list_documents", "content": big},
+            {"role": "assistant", "content": f"a{n}"}]
+
+
+def test_long_chats_are_trimmed_for_small_free_tiers(box, llm):
+    import agent
+    big = json.dumps({"data": "x" * 3000})
+    bot = _chat_agent(box, llm)
+    bot.history = (_msgs_for_exchange(1, big) + _msgs_for_exchange(2, big)
+                   + _msgs_for_exchange(3, big)[:3])        # q3 is still being answered
+    saved = json.dumps(bot.history)
+    base = len(agent.SYSTEM_PROMPT) + len(json.dumps(bot.tools))
+    total = base + sum(len(json.dumps(m)) for m in bot.history)
+
+    bot.max_chars = total - 1000                    # one old result has to go
+    w = bot.window()
+    assert w[2]["content"] == agent.LEFT_OUT and w[6]["content"] == big
+    assert w[-1]["content"] == big                  # the current request is never trimmed
+    assert [m["role"] for m in w] == [m["role"] for m in bot.history]
+
+    def size(msgs):
+        return sum(len(json.dumps(m)) for m in msgs)
+
+    stubbed = [dict(m, content=agent.LEFT_OUT) if m["role"] == "tool" else m
+               for m in bot.history[:8]] + bot.history[8:]
+    first_exchange = size(stubbed[:4])
+    bot.max_chars = base + size(stubbed) - first_exchange // 2   # trimming is not enough
+    w = bot.window()
+    assert w[0] == {"role": "user", "content": "q2"}             # oldest exchange left out
+    assert w[2]["content"] == agent.LEFT_OUT and w[-1]["content"] == big
+
+    bot.max_chars = 1                               # only the current request is left
+    assert [m.get("content") for m in bot.window()][0] == "q3"
+    assert json.dumps(bot.history) == saved         # the history itself is kept
+
+    bot.history = _msgs_for_exchange(1, big)        # end to end: what is really sent
+    llm.post_script = [oa_say("fine")]
+    assert bot.ask("q2") == "fine"
+    sent = llm.posts[-1]["body"]["messages"]
+    assert [(m["role"], m["content"]) for m in sent[1:]] == [("user", "q2")]
+    assert len(bot.history) == 6                    # nothing is forgotten locally
+
+    assert _chat_agent(box, llm).max_chars == PROVIDERS["groq"].max_chars == 16_000
+    assert _chat_agent(box, llm, provider="ollama").max_chars == 40_000
+
+
+def test_check_key_for_other_providers(clean, llm, monkeypatch):
+    agent = clean
+
+    def accepts_good(query, headers):
+        if headers.get("Authorization") == f"Bearer {GOOD_KEY}":
+            return (200, JSON, {"data": []})
+        return (401, JSON, {"error": {"message": "Invalid API Key",
+                                      "code": "invalid_api_key"}})
+
+    llm.routes["/openai/v1/models"] = accepts_good
+    llm.routes["/api/v1/key"] = accepts_good
+    _point(monkeypatch, "groq", llm)
+    _point(monkeypatch, "openrouter", llm)
+    assert agent.check_key(GOOD_KEY, provider="groq") == (True, "")
+    assert agent.check_key(BAD_KEY, provider="groq") == (False, "Groq didn't accept this key.")
+    assert agent.check_key(BAD_KEY, provider="openrouter") == (
+        False, "OpenRouter didn't accept this key.")
+    monkeypatch.setenv("MISTRAL_BASE_URL", f"http://127.0.0.1:{_closed_port()}/v1")
+    ok, reason = agent.check_key(GOOD_KEY, provider="mistral")
+    assert ok is None and "internet" in reason
+
+
+def test_keys_are_saved_per_provider(clean, llm, monkeypatch, capsys):
+    agent = clean
+    llm.routes["/openai/v1/models"] = lambda q, h: (
+        (200, JSON, {"data": []}) if h.get("Authorization") == f"Bearer {GOOD_KEY}"
+        else (401, JSON, {"error": {"message": "Invalid API Key"}}))
+    _point(monkeypatch, "groq", llm)
+    agent.KEY_FILE.parent.mkdir(parents=True)
+    agent.KEY_FILE.write_text("gemini-key-0123456789", encoding="utf-8")
+    _script_getpass(monkeypatch, agent, [BAD_KEY, GOOD_KEY])
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    assert agent.get_api_key(interactive=True, provider="groq") == (GOOD_KEY, "typed")
+    out = capsys.readouterr().out
+    assert "https://console.groq.com/keys" in out and "doesn't train" in out
+    assert "Groq didn't accept this key" in out and "Checking it with Groq" in out
+    groq_file = agent.KEY_FILE.parent / "groq_api_key.txt"
+    assert groq_file.read_text(encoding="utf-8") == GOOD_KEY
+    assert agent.get_api_key(interactive=False, provider="groq") == (GOOD_KEY, "file")
+    monkeypatch.setenv("GROQ_API_KEY", "from-env")
+    assert agent.get_api_key(interactive=False, provider="groq") == ("from-env", "env")
+
+    assert agent.main(["--provider", "groq", "--forget-key"]) == 0
+    assert not groq_file.exists() and agent.KEY_FILE.exists()   # Gemini's key stays
+    assert agent.main(["--provider", "ollama", "--forget-key"]) == 0
+    assert "doesn't use an API key" in capsys.readouterr().out
+
+
+def test_main_once_with_groq(clean, llm, box, monkeypatch, capsys):
+    agent = clean
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+    _point(monkeypatch, "groq", llm)
+    llm.post_script = [oa_calls(("add_footnotes", {"name": "Report"})), oa_say("**All** done.")]
+    code = agent.main(["--provider", "groq", "--once", "footnotes for Report",
+                       "--input-dir", str(box.input_dir), "--output-dir", str(box.output_dir)])
+    out = capsys.readouterr().out
+    assert code == 0 and "All done." in out and "**" not in out
+    assert "... adding footnotes to \"Report\"" in out
+    assert (box.output_dir / "Report_with_footnotes.docx").is_file()
+    assert llm.posts[0]["headers"]["Authorization"] == "Bearer groq-key"
+
+
+def test_ollama_must_be_running_and_have_the_model(clean, llm, box, monkeypatch, capsys):
+    agent = clean
+    dirs = ["--input-dir", str(box.input_dir), "--output-dir", str(box.output_dir)]
+    monkeypatch.setenv("OLLAMA_HOST", f"127.0.0.1:{_closed_port()}")
+    assert agent.main(["--provider", "ollama", "--once", "hi"] + dirs) == 2
+    assert "Ollama isn't running" in capsys.readouterr().out
+
+    _point(monkeypatch, "ollama", llm)
+    llm.routes["/api/tags"] = (200, JSON, {"models": [{"name": "granite4.1:3b"}]})
+    assert agent.main(["--provider", "ollama", "--once", "hi"] + dirs) == 2
+    out = capsys.readouterr().out
+    assert "ollama pull qwen3:8b" in out and "granite4.1:3b" in out
+
+    llm.post_script = [ol_say("Hello from your computer.")]
+    assert agent.main(["--provider", "ollama", "--model", "granite4.1:3b",
+                       "--once", "hi"] + dirs) == 0
+    assert "Hello from your computer." in capsys.readouterr().out
+    assert llm.posts[0]["body"]["model"] == "granite4.1:3b"
+
+
+def test_use_command_switches_ai_and_keeps_the_conversation(clean, box, monkeypatch, capsys):
+    agent = clean
+    groq, ollama = FakeServer(), FakeServer()
+    try:
+        monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+        _point(monkeypatch, "groq", groq)
+        _point(monkeypatch, "ollama", ollama)
+        groq.post_script = [oa_say("Hi! I can add footnotes.")]
+        ollama.routes["/api/tags"] = (200, JSON, {"models": [{"name": "qwen3:8b"}]})
+        ollama.post_script = [ol_say("You said hello.")]
+        monkeypatch.setattr(sys, "stdin", TTYInput(
+            "hello\n/use nothing\n/use ollama\nwhat did I say?\nexit\n"))
+        assert agent.main(["--provider", "groq", "--input-dir", str(box.input_dir),
+                           "--output-dir", str(box.output_dir)]) == 0
+        out = capsys.readouterr().out
+        assert "Brain: Groq, model openai/gpt-oss-120b" in out and "/use ollama" in out
+        assert "Type /use and one of" in out
+        assert "Now using Ollama (on your computer), model qwen3:8b" in out
+        assert "Agent> You said hello." in out
+        msgs = ollama.posts[0]["body"]["messages"]
+        assert [(m["role"], m["content"]) for m in msgs[1:]] == [
+            ("user", "hello"), ("assistant", "Hi! I can add footnotes."),
+            ("user", "what did I say?")]
+    finally:
+        groq.close()
+        ollama.close()
+
+
+def test_used_up_limit_offers_an_ai_you_have_a_key_for(clean, box, monkeypatch, capsys):
+    agent = clean
+    groq, mistral = FakeServer(), FakeServer()
+    try:
+        monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+        monkeypatch.setenv("MISTRAL_API_KEY", "mistral-key")
+        _point(monkeypatch, "groq", groq)
+        _point(monkeypatch, "mistral", mistral)
+        groq.post_script = [oa_error(429, DAILY_429, "rate_limit_exceeded")]
+        mistral.post_script = [oa_say("Hello from Mistral.")]
+        monkeypatch.setattr(sys, "stdin", TTYInput("hello\ny\nexit\n"))
+        assert agent.main(["--provider", "groq", "--input-dir", str(box.input_dir),
+                           "--output-dir", str(box.output_dir)]) == 0
+        out = capsys.readouterr().out
+        assert "used up Groq's free requests for today" in out
+        assert "Now using Mistral, model mistral-small-latest" in out
+        assert "Trying your message again..." in out and "Agent> Hello from Mistral." in out
+        assert len(groq.posts) == 1                        # a daily limit isn't retried
+        assert mistral.posts[0]["headers"]["Authorization"] == "Bearer mistral-key"
+    finally:
+        groq.close()
+        mistral.close()
+
+
+def test_used_up_limit_without_other_keys_gives_a_tip(clean, box, llm, monkeypatch, capsys):
+    agent = clean
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+    _point(monkeypatch, "groq", llm)
+    llm.post_script = [oa_error(429, DAILY_429, "rate_limit_exceeded")]
+    monkeypatch.setattr(sys, "stdin", TTYInput("hello\nexit\n"))
+    assert agent.main(["--provider", "groq", "--input-dir", str(box.input_dir),
+                       "--output-dir", str(box.output_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "Tip: you can carry on with another free AI" in out
+    assert "/use gemini, /use openrouter, /use mistral, /use ollama" in out
+
+
+def test_providers_list(clean, monkeypatch, capsys):
+    agent = clean
+    agent.KEY_FILE.parent.mkdir(parents=True)
+    agent.KEY_FILE.write_text("saved-gemini-key-012345", encoding="utf-8")
+    monkeypatch.setenv("MISTRAL_API_KEY", "m")
+    assert agent.main(["--providers"]) == 0
+    out = capsys.readouterr().out
+    for pid in PROVIDERS:
+        assert f"  {pid} - " in out
+    assert "gemini - Google Gemini, the default (key saved)" in out
+    assert "groq - Groq (no key yet)" in out and "https://console.groq.com/keys" in out
+    assert "mistral - Mistral (key in an environment variable)" in out
+    assert "(no key needed)" in out and "Nothing leaves your computer." in out
+
+
+@needs_genai
+def test_gemini_continues_a_conversation_from_another_ai(box, gemini):
+    gemini.post_script = [say("You said hello.")]
+    bot = _agent(box, gemini)
+    bot.seed([("hello", "Hi! I can add footnotes.")])
+    assert bot.ask("what did I say?") == "You said hello."
+    turns = gemini.posts[0]["body"]["contents"]
+    assert [(t["role"], t["parts"][0]["text"]) for t in turns] == [
+        ("user", "hello"), ("model", "Hi! I can add footnotes."), ("user", "what did I say?")]
+
+
+def test_waiting_is_shown(capsys):
+    import agent
+    agent._show_wait(PROVIDERS["groq"], 7.2, ProviderError("groq", 429, "slow down"))
+    agent._show_wait(PROVIDERS["mistral"], 2, ProviderError("mistral", 503, "busy"))
+    out = capsys.readouterr().out
+    assert "  ... Groq's per-minute limit is reached - waiting 8 seconds" in out
+    assert "  ... Mistral is busy - waiting 2 seconds" in out
+
+
+def test_chat_agent_short_empty_and_endless_answers(box, llm):
+    llm.post_script = [{"choices": [{"finish_reason": "length", "message": {
+        "role": "assistant", "content": "Problems: [5] is not in"}}]}]
+    bot = _chat_agent(box, llm)
+    answer = bot.ask("list the problems")
+    assert answer.startswith("Problems: [5] is not in") and "cut short" in answer
+    assert bot.history[-1]["content"] == "Problems: [5] is not in"   # the note stays local
+
+    llm.post_script = [{"choices": [{"finish_reason": "content_filter", "message": {
+        "role": "assistant", "content": ""}}]}]
+    bot = _chat_agent(box, llm, provider="mistral")
+    assert bot.ask("hi") == ("(Mistral sent an empty answer - reason: content_filter. "
+                             "Please try asking in a different way.)")
+    assert bot.history == []
+
+    llm.post_script = [oa_calls(("list_documents",))] * 3
+    bot = _chat_agent(box, llm, max_steps=3)
+    assert "too many steps" in bot.ask("loop") and bot.history == []

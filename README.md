@@ -27,11 +27,13 @@ authoritative number → source-URL mapping.
   footnotes (idempotency guard), while unrelated pre-existing footnotes never
   block new citations and are preserved verbatim.
 
-**AI agent (optional).** `python agent.py` starts a chat in which Google
-Gemini runs these tools for you ("add footnotes to my RALF essay", "check the
-links in my AI essay") and explains any problems in plain English. It can also
-check that every reference link works and leads to the paper it names. See
-[AI agent (chat with Gemini)](#ai-agent-chat-with-gemini).
+**AI agent (optional).** `python agent.py` starts a chat in which a free AI
+(Google Gemini by default; Groq, OpenRouter, Mistral or Ollama on your own
+computer also work) runs these tools for you ("add footnotes to my RALF
+essay", "check the links in my AI essay") and explains any problems in plain
+English. It can also check that every reference link works and leads to the
+paper it names. See
+[AI agent (chat with Gemini or another free AI)](#ai-agent-chat-with-gemini-or-another-free-ai).
 
 ---
 
@@ -50,7 +52,8 @@ citation_agent/
 ├── validator.py           # input-unchanged + full post-save output validation
 ├── report.py              # citation_review_report.csv writer
 ├── agent_tools.py         # the AI agent's tools (Toolbox) + narrow pipeline wrappers
-├── agent.py               # AI agent: terminal chat, Google Gemini decides which tool to run
+├── agent.py               # AI agent: terminal chat, the AI decides which tool to run
+├── llm_providers.py       # the other free AIs: Groq, OpenRouter, Mistral, Ollama
 ├── link_checker.py        # does each reference link work / lead to that paper? (Crossref, ...)
 ├── requirements.txt
 ├── requirements-agent.txt # requirements.txt + Google's Gemini SDK (for agent.py)
@@ -60,7 +63,7 @@ citation_agent/
     ├── create_sample.py   # builds a realistic sample .docx (incl. a manual footnote)
     ├── validate_sample.py # deep checks of the sample output (OOXML level)
     ├── test_pipeline.py   # pytest end-to-end suite (48 tests)
-    └── test_agent.py      # agent, tools and link checker, fully offline (66 tests)
+    └── test_agent.py      # agent, AIs, tools, link checker, fully offline (105 tests)
 ```
 
 ## Requirements
@@ -82,8 +85,9 @@ python -m venv .venv
 .venv/bin/pip install pytest
 ```
 
-For the AI agent (`agent.py`) use Python **3.10+** and install
-`requirements-agent.txt` instead (it includes `requirements.txt`).
+For the AI agent (`agent.py`) install `requirements-agent.txt` instead (it
+includes `requirements.txt`). Gemini needs Python **3.10+**; the other free
+AIs need nothing beyond `requirements.txt`.
 
 ## How to run
 
@@ -132,13 +136,15 @@ Ambiguous citations: 0
 Validation         : PASS
 ```
 
-## AI agent (chat with Gemini)
+## AI agent (chat with Gemini or another free AI)
 
 `agent.py` lets you use the tool by chatting instead of typing commands.
-Google Gemini is the "brain": it understands what you ask, decides which tool
-to run and explains the results in plain English. The tools are the tested
-code of this project, so every guarantee above still holds: the AI cannot
-edit your documents itself, invent links or open other files.
+A free AI is the "brain" (Google Gemini by default, or
+[Groq, OpenRouter, Mistral or Ollama](#other-free-ais-groq-openrouter-mistral-ollama)):
+it understands what you ask, decides which tool to run and explains the
+results in plain English. The tools are the tested code of this project, so
+every guarantee above still holds whichever AI you pick: the AI cannot edit
+your documents itself, invent links or open other files.
 
 ```
 You> add footnotes to my RALF essay
@@ -160,14 +166,16 @@ Things you can ask, for example:
 
 ### Setup (once)
 
-1. **Python 3.10 or newer** (`main.py` on its own still works on 3.9).
+1. **Python 3.10 or newer** for Gemini (`main.py` and the other AIs also
+   work on 3.9).
 2. In the project folder, with the virtual environment active:
    ```
    pip install -r requirements-agent.txt
    ```
 3. Get a **free Gemini API key** at <https://aistudio.google.com/apikey>:
    sign in with a Google account and click *Create API key*. No credit card
-   is needed.
+   is needed. (Prefer another AI? See
+   [below](#other-free-ais-groq-openrouter-mistral-ollama).)
 
 ### Start it
 
@@ -191,10 +199,79 @@ replace a key yourself, run `python agent.py --forget-key` (or delete
 | Option | Effect |
 | --- | --- |
 | `--once "check the links in my RALF essay"` | one question, one answer, then exit |
-| `--model gemini-3.8-flash` | use a specific model. Default `gemini-flash-latest`, Google's alias for its newest Flash model (or set `GEMINI_MODEL`) |
-| `--forget-key` | delete the saved key |
+| `--provider groq` | think with another free AI: `gemini` (default), `groq`, `openrouter`, `mistral`, `ollama` (see below) |
+| `--providers` | list the free AIs, their limits, privacy terms and where to get a key |
+| `--model gemini-3.8-flash` | use a specific model. Default: the provider's; for Gemini `gemini-flash-latest`, Google's alias for its newest Flash model (or set `GEMINI_MODEL`, `GROQ_MODEL`, ...) |
+| `--forget-key` | delete the saved key (of `--provider`, default Gemini) |
 | `--input-dir`, `--output-dir` | folders to use (default: `input/` and `output/` next to `agent.py`) |
-| `GEMINI_API_KEY` environment variable | used instead of the saved key |
+| `GEMINI_API_KEY` environment variable | used instead of the saved key (likewise `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`) |
+
+In the chat, `/use groq` (or any other provider name) switches AI; see below.
+
+### Other free AIs: Groq, OpenRouter, Mistral, Ollama
+
+Gemini stays the default. For a second AI when Gemini's daily limit is used
+up, or for different privacy terms, the agent can also think with these
+(free limits as of September 2026; `python agent.py --providers` shows the
+same list):
+
+| `--provider` | Free allowance | Card needed? | What happens to what the agent sends | Default model |
+| --- | --- | --- | --- | --- |
+| `gemini` | daily limits, shown in AI Studio | no | free tier: Google may use it to improve its products | `gemini-flash-latest` |
+| `groq` | 1,000 requests a day, 30 a minute, 8,000 tokens a minute | no | not used for training, not kept (except up to 30 days for abuse checks) | `openai/gpt-oss-120b` |
+| `openrouter` | 50 requests a day, 20 a minute (1,000 a day after a one-time $10 top-up) | no | free models are run by other companies that may keep and train on it; you have to allow this in OpenRouter's privacy settings | `openrouter/free` (picks a current free model that can use tools) |
+| `mistral` | a monthly allowance in "Free mode", limits shown in the console | no (phone number needed) | may be used for training unless you turn that off | `mistral-small-latest` |
+| `ollama` | unlimited: runs on your own computer | no key at all | never leaves your computer | `qwen3:8b` (5 GB download, about 8 GB free memory) |
+
+Every provider needs a model that can call tools; all the defaults can.
+
+```
+python agent.py --provider groq         # asks for a Groq key the first time
+python agent.py --provider openrouter
+python agent.py --provider mistral
+python agent.py --provider ollama       # after installing Ollama and: ollama pull qwen3:8b
+```
+
+Keys: Groq <https://console.groq.com/keys>, OpenRouter
+<https://openrouter.ai/settings/keys>, Mistral
+<https://console.mistral.ai/api-keys>. Like the Gemini key, each key is
+checked before it is saved, is kept in its own file next to the Gemini key
+(`groq_api_key.txt`, ...) and can be removed with
+`python agent.py --provider groq --forget-key`.
+
+**Switching during a chat.** Type `/use groq` (or `/use gemini`,
+`/use ollama`, ..., optionally followed by a model name). The conversation so
+far comes along as text; the new AI calls the tools again when it needs the
+details. When an AI's free limit is used up, the agent offers to switch to
+one you already have a key for and sends your message again.
+
+Good to know:
+
+* **Groq** is very fast, but its free 8,000 tokens a minute cover only one
+  or two steps of a question. When the minute is used up, the agent waits as
+  long as Groq asks (seconds, at most a minute) and carries on by itself:
+  `... Groq's per-minute limit is reached - waiting 20 seconds`. To use as
+  little as possible, it asks Groq for short answers (at most 1,500 tokens)
+  and, in long chats, leaves out old tool results.
+* **OpenRouter**'s free models change often; `openrouter/free` always picks
+  one that is currently free and can use tools. If the agent says free models
+  "only work after you allow them", turn on the free-model options at
+  <https://openrouter.ai/settings/privacy>. That is the setting that lets
+  those companies keep your prompts.
+* **Ollama**: install it from <https://ollama.com/download>, then run
+  `ollama pull qwen3:8b` once. On a computer with little memory try
+  `ollama pull granite4.1:3b` and `--model granite4.1:3b` (faster, less
+  accurate). The agent asks Ollama for a 16K-token context window, because
+  Ollama's default on most laptops (4K) silently cuts off longer requests.
+* Smaller free models follow instructions less reliably than Gemini. They
+  can't do any damage, though: footnotes still come only from the tested
+  pipeline and your reference list.
+* **Not free (September 2026):** GitHub Models was retired on 30 July 2026;
+  Cerebras replaced its free tier with a $5 trial that needs a card;
+  OpenAI, Anthropic, DeepSeek and xAI have no free API. Other
+  OpenAI-compatible services (for example Cloudflare Workers AI, Cohere's
+  trial key or NVIDIA's free endpoints) can be added with one entry in
+  `llm_providers.PROVIDERS`.
 
 ### The four tools the AI can use
 
@@ -236,14 +313,16 @@ replacement links.
 
 ### Privacy and cost
 
-* Gemini receives your messages, file names, section headings, citation
+* The AI receives your messages, file names, section headings, citation
   markers, the **reference list** and the tools' results. It does **not**
   receive the body text of your document.
 * On Gemini's **free tier, Google may use this content to improve its
   products** (see the [pricing page](https://ai.google.dev/gemini-api/docs/pricing)).
-  Don't use the free tier for confidential documents.
-* The free tier has per-minute and per-day limits. If you hit one, the agent
-  tells you; wait a minute and try again.
+  Don't use the free tier for confidential documents. The other AIs' terms
+  are in the table above; with Ollama nothing leaves your computer.
+* Free tiers have per-minute and per-day limits. If you hit one, the agent
+  tells you (and offers another AI you have a key for); wait a minute and try
+  again.
 
 ### Troubleshooting
 
@@ -255,7 +334,13 @@ replacement links.
 | "free-tier limit" | wait a minute (or until tomorrow for the daily limit) |
 | "doesn't offer the model" | `python agent.py --model gemini-3.8-flash` |
 | "needs Google's Gemini package" | `pip install -r requirements-agent.txt` |
-| "needs Python 3.10 or newer" | install a newer Python from python.org |
+| "needs Python 3.10 or newer" | install a newer Python from python.org, or use another AI (`--provider groq`) |
+| "per-minute limit is reached - waiting ..." | normal on Groq's free plan; the agent retries by itself |
+| "used up ...'s free requests for today" | try again later, or `/use` another AI |
+| "free models only work after you allow them" | OpenRouter: allow the free-model options at <https://openrouter.ai/settings/privacy> (or use another AI) |
+| "Ollama isn't running" | start the Ollama app (install it from <https://ollama.com/download>) |
+| "isn't on this computer yet" / "isn't in Ollama yet" | `ollama pull qwen3:8b` (or the model named in the message) |
+| "can't use tools" | choose a model that supports tools (`--model ...`) |
 
 ## Citation syntax supported
 
@@ -458,8 +543,8 @@ backend is the validated default and is what the test suite exercises.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v                 # 114 tests: 48 pipeline (OOXML-level)
-                                           #   + 66 agent / link checker (offline)
+python -m pytest tests/ -v                 # 153 tests: 48 pipeline (OOXML-level)
+                                           #   + 105 agent / link checker (offline)
 python tests/create_sample.py              # (re)generate input/sample.docx
                                            #   (or: create_sample.py OUT.docx)
 python main.py                             # process the sample
@@ -492,8 +577,13 @@ files, ambiguous names); previews that write nothing; footnotes via the
 agent with the original unchanged; problems explained; multi-step and
 parallel tool calls; Gemini 3 thought signatures sent back unchanged; tool
 errors returned to the model; API errors turned into advice with the
-conversation rolled back; the step limit; API-key handling. The Gemini tests
-are skipped when `google-genai` is not installed.
+conversation rolled back; the step limit; API-key handling. Fake Groq,
+OpenRouter, Mistral and Ollama servers cover the other AIs: OpenAI-format
+tool calls, Ollama's own format and context size, waiting for per-minute
+limits, retries when a service is busy, error advice for each service,
+trimming long chats, one key file per service, `/use` switching with the
+conversation, and the offer to switch when a limit is used up. The Gemini
+tests are skipped when `google-genai` is not installed.
 
 Regression tests for issues found on real Word documents: runs carrying
 `w:lastRenderedPageBreak` (8 layouts × both modes, checked against an oracle
@@ -550,9 +640,15 @@ reproducible. The AI only decides *which* tool to call and explains the
 results:
 
 ```
-you -> agent.py -> Gemini (decides) -> agent_tools.Toolbox -> main.run / link_checker
+you -> agent.py -> the AI (decides) -> agent_tools.Toolbox -> main.run / link_checker
                           ^------------- plain JSON results --------------'
 ```
+
+* Gemini is driven through Google's `google-genai` SDK (`CitationAgent`).
+  Groq, OpenRouter and Mistral use the OpenAI chat-completions format and
+  Ollama its own `/api/chat`, through `llm_providers.ChatClient`
+  (standard library only) and `ChatAgent`. Every AI gets the same system
+  prompt, the same four tools and the same rules.
 
 * `agent_tools.Toolbox` is the entire interface: four tools with JSON inputs
   and outputs. Errors come back as `{"error": ...}` so the model can explain

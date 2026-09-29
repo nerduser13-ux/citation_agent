@@ -829,21 +829,26 @@ def test_com_backend_rejected_on_linux(tmp_path):
 
 
 def test_sample_end_to_end(tmp_path):
-    """The sample document (regenerated via tests/create_sample.py) must pass
-    end-to-end: 11 new footnotes + 1 pre-existing preserved, input untouched."""
+    """The sample document (freshly generated via tests/create_sample.py) must
+    pass end-to-end: 11 new footnotes + 1 pre-existing preserved, input
+    untouched. Generated into tmp_path - running the suite never modifies
+    the tracked input/sample.docx."""
     import subprocess
     import sys as _sys
     venv = ROOT / ".venv"
     py = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     if not py.exists():
         py = _sys.executable
+    local = tmp_path / "sample.docx"
+    tracked = ROOT / "input" / "sample.docx"
+    tracked_before = sha256(tracked) if tracked.exists() else None
     proc = subprocess.run(
-        [str(py), str(ROOT / "tests" / "create_sample.py")],
+        [str(py), str(ROOT / "tests" / "create_sample.py"), str(local)],
         cwd=ROOT, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
-    sample = ROOT / "input" / "sample.docx"
-    local = tmp_path / "sample.docx"
-    local.write_bytes(sample.read_bytes())  # run on a copy
+    assert local.exists()
+    if tracked_before is not None:
+        assert sha256(tracked) == tracked_before  # repo file left alone
     before = sha256(local)
     rc, _ = run_tool(local, tmp_path)
     assert rc == 0
@@ -854,3 +859,280 @@ def test_sample_end_to_end(tmp_path):
     assert summary["Footnotes_inserted"] == "11"
     assert summary["Existing_footnotes_preserved"] == "True"
     assert summary["Input_unchanged"] == "True"
+
+
+# --------------------------------------------------------------------------
+# Regressions found on real Word documents / realistic structures
+# --------------------------------------------------------------------------
+def _run_from_spec(spec):
+    """A w:r built from ``spec``: every '|' is a w:lastRenderedPageBreak at
+    that text position (Word's layout-cache hint), the rest is w:t text."""
+    r = OxmlElement("w:r")
+    for i, piece in enumerate(spec.split("|")):
+        if i:
+            r.append(OxmlElement("w:lastRenderedPageBreak"))
+        if piece:
+            t = OxmlElement("w:t")
+            t.set(qn("xml:space"), "preserve")
+            t.text = piece
+            r.append(t)
+    return r
+
+
+def _tokens(p_elem):
+    """Linearised paragraph: characters, '<PB>' page-break hints, '<FN>'
+    footnote references - in document order."""
+    out = []
+    for el in p_elem.iter(qn("w:t"), qn("w:lastRenderedPageBreak"),
+                          qn("w:footnoteReference")):
+        if el.tag == qn("w:t"):
+            out.extend(el.text or "")
+        elif el.tag == qn("w:lastRenderedPageBreak"):
+            out.append("<PB>")
+        else:
+            out.append("<FN>")
+    return out
+
+
+def _expected_tokens(spec, replace):
+    """Oracle: the input stream with every marker followed by its footnote
+    references (keep mode) or replaced by them (replace mode). A page-break
+    hint strictly inside a replaced marker stays where the marker was, i.e.
+    immediately before the footnote references."""
+    plain = spec.replace("|", "")
+    spans = {}
+    for m in re.finditer(r"\[(\d+)\](?:\s*[-\u2013\u2014]\s*\[(\d+)\])?", plain):
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        spans[m.start()] = (m.end(), b - a + 1)
+    out, deferred, cur, i = [], [], None, 0
+    for ch in spec:
+        if ch == "|":
+            (deferred if (replace and cur) else out).append("<PB>")
+            continue
+        if cur is None and i in spans:
+            cur = spans[i]
+        if not (replace and cur):
+            out.append(ch)
+        i += 1
+        if cur and i == cur[0]:
+            out.extend(deferred + ["<FN>"] * cur[1])
+            deferred, cur = [], None
+    return out
+
+
+PAGE_BREAK_SPECS = [
+    "|head [1] tail",         # the layout Word writes (hint first in run)
+    "|[1] tail",              # hint directly before a leading marker
+    "head [1]|",              # hint at the very end, run ends with marker
+    "he|ad [1] tail",         # hint inside the text before the marker
+    "head [|1] tail",         # hint inside the marker itself
+    "head [1]| tail",         # hint directly after the marker
+    "|a [1]|b| [2] c|",       # several hints and citations in one run
+    "x [1]-|[3] y",           # hint inside a range marker
+]
+
+
+@pytest.mark.parametrize("keep", [False, True], ids=["replace", "keep-marker"])
+def test_last_rendered_page_break_runs_processed(tmp_path, keep):
+    # Word stores <w:lastRenderedPageBreak/> in runs of practically every
+    # multi-page document. Such runs used to be rejected as "non-text
+    # content" (AMBIGUOUS) - 5 of 30 citations in real test documents.
+    doc = Document()
+    for spec in PAGE_BREAK_SPECS:
+        doc.add_paragraph()._p.append(_run_from_spec(spec))
+    doc.add_heading("References", level=1)
+    for r in REFS:
+        doc.add_paragraph(r)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path, *(["--keep-marker"] if keep else []))
+    assert rc == 0  # includes the validator's structural-count check
+    _rows, summary = read_csv(tmp_path)
+    assert summary["Ambiguous_citations"] == "0"
+    assert summary["Footnotes_inserted"] == "11"   # 6x1 + 2 + range 1..3
+    out_doc, _z, _ft = load(output_path(tmp_path))
+    out_paras = [p for p, _w in _iter(out_doc)][:len(PAGE_BREAK_SPECS)]
+    for spec, p in zip(PAGE_BREAK_SPECS, out_paras):
+        assert _tokens(p._p) == _expected_tokens(spec, replace=not keep), spec
+
+
+def test_citation_in_content_control(tmp_path):
+    # Paragraphs of a block-level content control live in w:sdtContent; they
+    # used to be invisible (citations neither processed nor reported).
+    doc = Document()
+    doc.add_paragraph("Intro [1].")
+    sdt = OxmlElement("w:sdt")
+    sdt.append(OxmlElement("w:sdtPr"))
+    content = OxmlElement("w:sdtContent")
+    sdt.append(content)
+    content.append(doc.add_paragraph("Inside a content control [2].")._p)
+    body = doc.element.body
+    body.insert(len(body) - 1, sdt)          # before w:sectPr
+    doc.add_heading("References", level=1)
+    for r in REFS:
+        doc.add_paragraph(r)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    doc2, _z, ft = load(output_path(tmp_path))
+    assert {fn_text(f) for f in regular(ft)} == {"https://example.com/one",
+                                                 "https://example.com/two"}
+    sdt_text = raw_text_of(doc2.element.body.find(qn("w:sdt")))
+    assert sdt_text == "Inside a content control ."
+    rows, _summary = read_csv(tmp_path)
+    assert any("sdt" in row[1] for row in rows[1:] if row and row[0] == "2")
+
+
+def test_bold_heading_after_references_ends_list(tmp_path):
+    # Documents without heading styles: a bold "Appendix A" after the list
+    # used to be glued onto the last reference, so the appendix URL ended
+    # up in that reference's footnote.
+    doc = Document()
+    doc.add_paragraph("Body cites [3].")
+    doc.add_paragraph().add_run("References").bold = True
+    for r in REFS[:3]:
+        doc.add_paragraph(r)
+    doc.add_paragraph().add_run("Appendix A").bold = True
+    doc.add_paragraph("Survey platform used: https://survey-tool.example/form")
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    _d, _z, ft = load(output_path(tmp_path))
+    assert [fn_text(f) for f in regular(ft)] == ["https://example.com/three"]
+    _rows, summary = read_csv(tmp_path)
+    assert summary["References_detected"] == "3"
+
+
+def test_table_header_keyword_not_reference_heading(tmp_path):
+    # A bold "Reference" column header in an appendix table must not take
+    # over as the reference heading (which turned the real reference list
+    # into "body" text).
+    doc = Document()
+    doc.add_paragraph("Body cites [1] and [2].")
+    doc.add_paragraph().add_run("References").bold = True
+    for r in ["[1] Alpha. https://example.com/one",
+              "[2] Beta. https://example.com/two",
+              "[3] Gamma. https://example.com/three"]:
+        doc.add_paragraph(r)
+    doc.add_paragraph().add_run("Appendix B: Studies reviewed").bold = True
+    tbl = doc.add_table(rows=2, cols=2)
+    tbl.cell(0, 0).paragraphs[0].add_run("Reference").bold = True
+    tbl.cell(0, 1).paragraphs[0].add_run("Finding").bold = True
+    tbl.cell(1, 0).text = "[1]"
+    tbl.cell(1, 1).text = "Positive effect"
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    _d, _z, ft = load(output_path(tmp_path))
+    assert {fn_text(f) for f in regular(ft)} == {"https://example.com/one",
+                                                 "https://example.com/two"}
+    _rows, summary = read_csv(tmp_path)
+    assert summary["Citation_markers_detected"] == "2"
+    assert summary["References_detected"] == "3"
+
+
+def _field_run(kind=None, instr=None, text=None):
+    r = OxmlElement("w:r")
+    if kind:
+        el = OxmlElement("w:fldChar")
+        el.set(qn("w:fldCharType"), kind)
+    elif instr:
+        el = OxmlElement("w:instrText")
+        el.set(qn("xml:space"), "preserve")
+        el.text = instr
+    else:
+        el = OxmlElement("w:t")
+        el.set(qn("xml:space"), "preserve")
+        el.text = text
+    r.append(el)
+    return r
+
+
+def test_citation_in_field_result_untouched(tmp_path):
+    # EndNote / Zotero / Mendeley Desktop store "[1]" as the RESULT of a
+    # complex field. A footnote inserted there is destroyed (or breaks the
+    # field) on the next refresh, so it must be left alone and reported.
+    doc = Document()
+    p = doc.add_paragraph()
+    for r in (_field_run(text="Managed by EndNote "),
+              _field_run(kind="begin"),
+              _field_run(instr=" ADDIN EN.CITE <EndNote><Cite/></EndNote> "),
+              _field_run(kind="separate"),
+              _field_run(text="[1]"),
+              _field_run(kind="end"),
+              _field_run(text=" and a typed one [2].")):
+        p._p.append(r)
+    doc.add_heading("References", level=1)
+    for r in REFS:
+        doc.add_paragraph(r)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    _d, z, ft = load(output_path(tmp_path))
+    assert [fn_text(f) for f in regular(ft)] == ["https://example.com/two"]
+    xml = z.read("word/document.xml").decode()
+    result = xml[xml.find('w:fldCharType="separate"'):xml.find('w:fldCharType="end"')]
+    assert "[1]" in result and "footnoteReference" not in result
+    _rows, summary = read_csv(tmp_path)
+    assert summary["Ambiguous_citations"] == "1"
+
+
+def test_uncited_excludes_unprocessed_citations(tmp_path):
+    # A reference cited only by a marker that could not be processed
+    # (here: split across runs -> AMBIGUOUS) is still cited, not "uncited".
+    doc = Document()
+    p = doc.add_paragraph()
+    p.add_run("See [1] and [3")
+    p.add_run("] split.")
+    doc.add_heading("References", level=1)
+    for r in REFS:
+        doc.add_paragraph(r)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    _rows, summary = read_csv(tmp_path)
+    assert summary["Ambiguous_citations"] == "1"
+    assert summary["Uncited_references"] == "2, 4"
+
+
+def test_run_pipeline_returns_actual_output_path(tmp_path):
+    import agent_tools
+    src = make_doc(tmp_path / "t.docx", ["A [1] B."])
+    out_dir = tmp_path / "agent_out"
+    code1, out1, rep1 = agent_tools.run_pipeline(str(src), output_dir=str(out_dir))
+    code2, out2, rep2 = agent_tools.run_pipeline(str(src), output_dir=str(out_dir))
+    assert code1 == 0 and code2 == 0
+    assert Path(out1).name == "t_with_footnotes.docx" and Path(out1).is_file()
+    assert Path(out2).name == "t_with_footnotes_1.docx" and Path(out2).is_file()
+    assert Path(rep2).is_file()
+    noref = make_doc(tmp_path / "noref.docx", ["Just prose."], refs=None, heading=None)
+    code3, out3, rep3 = agent_tools.run_pipeline(str(noref),
+                                                 output_dir=str(tmp_path / "abort"))
+    assert code3 == 1 and out3 is None and Path(rep3).is_file()
+
+
+def test_superscript_inserted_in_schema_order(tmp_path):
+    # w:rPr is a strict sequence: w:vertAlign must precede w:lang (present
+    # in most Word-authored runs); appending it produced invalid OOXML.
+    doc = Document()
+    run = doc.add_paragraph().add_run("Tagged run cites [1] here.")
+    run.bold = True
+    lang = OxmlElement("w:lang")
+    lang.set(qn("w:val"), "en-GB")
+    run._r.get_or_add_rPr().append(lang)
+    doc.add_heading("References", level=1)
+    for r in REFS:
+        doc.add_paragraph(r)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    doc2, _z, _ft = load(output_path(tmp_path))
+    ref = next(doc2.element.body.iter(qn("w:footnoteReference")))
+    names = [etree.QName(c).localname for c in ref.getparent().find(qn("w:rPr"))]
+    assert names == ["rStyle", "b", "vertAlign", "lang"]

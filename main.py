@@ -102,6 +102,10 @@ def run(config):
     except ValueError as e:
         print(f"ERROR: {e}")
         return 2
+    # The collision-safe name actually used (e.g. ..._with_footnotes_1.docx),
+    # so programmatic callers (agent_tools.run_pipeline) can report it.
+    config.resolved_output_path = out_path
+    report_path = out_path.with_name("citation_review_report.csv")
 
     in_hash = file_hash(inp)
     print("Word Citation Footnote Agent")
@@ -138,8 +142,8 @@ def run(config):
             All_footnote_URLs_from_refs="n/a (not processed)",
             Input_unchanged=original_unchanged(inp, in_hash),
         )
-        report_path = out_path.with_name("citation_review_report.csv")
         rep.write(str(report_path))
+        config.report_path = report_path
         print(f"Report : {report_path}")
         return 1
 
@@ -208,7 +212,9 @@ def run(config):
     ambiguous = [c for c in citations if c.status == "AMBIGUOUS"]
     previously = [c for c in citations if c.status == "SKIPPED"]
     missing_urls = sorted({n for n, v in ref_map.items() if not v["url"]})
-    cited = {n for c in citations if c.status in ("SUCCESS", "SKIPPED") for n in c.numbers}
+    # "Uncited" means never cited in the body - a reference whose markers
+    # could not be processed (AMBIGUOUS / ERROR) is still cited.
+    cited = {n for c in citations for n in c.numbers}
     uncited = sorted(set(ref_map) - cited)
 
     rep = Report()
@@ -238,8 +244,8 @@ def run(config):
         Input_unchanged=r.get("input_unchanged", False),
         Status="OK" if val["ok"] else "VALIDATION FAILED",
     )
-    report_path = out_path.with_name("citation_review_report.csv")
     rep.write(str(report_path))
+    config.report_path = report_path
 
     print()
     print(f"Footnotes inserted : {footnotes_inserted}")

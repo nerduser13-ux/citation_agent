@@ -23,7 +23,7 @@ _TBL = qn("w:tbl")
 _TR = qn("w:tr")
 _TC = qn("w:tc")
 _SDT = qn("w:sdt")
-_SDT_SKIP = (qn("w:sdtPr"), qn("w:alias"))
+_SDT_CONTENT = qn("w:sdtContent")
 
 
 # --------------------------------------------------------------------------
@@ -59,17 +59,14 @@ def _iter_table(tbl, doc, where: str) -> Iterator[Tuple[Paragraph, str]]:
 
 
 def _iter_sdt(sdt, doc, where: str) -> Iterator[Tuple[Paragraph, str]]:
+    """A block-level content control is ``<w:sdt><w:sdtPr/><w:sdtEndPr/>
+    <w:sdtContent>...block content...</w:sdtContent></w:sdt>``: its paragraphs
+    live inside ``w:sdtContent``, never directly under ``w:sdt``."""
     sdt_where = f"{where} > sdt" if where else "sdt"
-    for child in sdt:
-        if child.tag in _SDT_SKIP:
-            continue
-        if child.tag == _P:
-            yield Paragraph(child, doc), sdt_where
-        elif child.tag == _TBL:
-            yield from _iter_table(child, doc, sdt_where)
-        elif child.tag == _SDT:
-            yield from _iter_sdt(child, doc, sdt_where)
-        # w:sdtPr / w:alias and inline-only content are skipped.
+    content = sdt.find(_SDT_CONTENT)
+    if content is None:
+        return
+    yield from _iter_block_content(content, doc, sdt_where)
 
 
 def iter_paragraph_info(doc) -> Iterator[Tuple[Paragraph, str]]:
@@ -91,6 +88,11 @@ def iter_paragraphs(doc) -> Iterator[Paragraph]:
 def paragraph_locations(doc) -> List[str]:
     """Aligned location descriptors for :func:`iter_paragraphs` output."""
     return [where or "body" for _p, where in iter_paragraph_info(doc)]
+
+
+def in_table(paragraph) -> bool:
+    """True when the paragraph sits inside a table cell (at any depth)."""
+    return any(a.tag == _TC for a in paragraph._p.iterancestors())
 
 
 # --------------------------------------------------------------------------

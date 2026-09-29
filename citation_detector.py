@@ -20,8 +20,12 @@ the surgical inserter in word_footnotes.py, so a marker after a hyperlink is
 never mis-attributed to the hyperlink's runs.
 
 SAFETY: markers inside ``<w:hyperlink>`` elements are reported (AMBIGUOUS) but
-never modified. Markers that span runs are resolved as AMBIGUOUS at processing
-time. Reversed ranges ([3]-[1]) are reported AMBIGUOUS rather than guessed.
+never modified. Markers that are (part of) the displayed result of a complex
+field - how EndNote, Zotero and Mendeley Desktop store "[1]", and how
+cross-references work - are reported AMBIGUOUS: a footnote inserted there would
+be destroyed (or break the field) the next time the field is refreshed.
+Markers that span runs are resolved as AMBIGUOUS at processing time. Reversed
+ranges ([3]-[1]) are reported AMBIGUOUS rather than guessed.
 
 Statuses:
     pending    -> not yet processed (resolved by word_footnotes.process_paragraph)
@@ -42,6 +46,48 @@ STATUS_SUCCESS = "SUCCESS"
 STATUS_ERROR = "ERROR"
 STATUS_SKIPPED = "SKIPPED"
 STATUS_AMBIGUOUS = "AMBIGUOUS"
+
+_W_R = qn("w:r")
+_W_T = qn("w:t")
+_FLDCHAR = qn("w:fldChar")
+_FLDCHAR_TYPE = qn("w:fldCharType")
+_TXBX = qn("w:txbxContent")
+
+
+def _apply_field_chars(elem, depth):
+    """Update the complex-field nesting ``depth`` with every w:fldChar under
+    ``elem`` (document order). Text boxes are skipped: their fields are
+    self-contained and belong to a different story."""
+    stack = [elem]
+    while stack:
+        node = stack.pop()
+        if node.tag == _TXBX:
+            continue
+        if node.tag == _FLDCHAR:
+            kind = node.get(_FLDCHAR_TYPE)
+            if kind == "begin":
+                depth += 1
+            elif kind == "end":
+                depth = max(0, depth - 1)
+            continue
+        stack.extend(reversed(list(node)))
+    return depth
+
+
+def field_result_spans(p_elem, depth):
+    """Direct-run coordinate spans ``[(start, end)]`` of the paragraph's runs
+    that sit inside a complex field (between fldChar begin and end), plus the
+    nesting depth after the paragraph (fields may span paragraphs)."""
+    spans = []
+    pos = 0
+    for child in p_elem:
+        if child.tag == _W_R:
+            length = sum(len(t.text or "") for t in child.findall(_W_T))
+            if depth > 0 and length:
+                spans.append((pos, pos + length))
+            pos += length
+        depth = _apply_field_chars(child, depth)
+    return spans, depth
 
 
 @dataclass
@@ -70,14 +116,17 @@ class CitationDetector:
         """Detect citation markers in body paragraphs only
         (index < ref_section_start)."""
         citations = []
+        field_depth = 0   # complex-field nesting, carried across paragraphs
         for idx, p in enumerate(paragraphs):
             if idx >= ref_section_start:
                 break
             t = direct_run_text_of(p._p)
+            in_field, field_depth = field_result_spans(p._p, field_depth)
             tokens = [
                 (m.start(), m.end(), int(m.group()[1:-1]))
                 for m in self.TOKEN_RE.finditer(t)
             ]
+            para_cites = []
             i = 0
             while i < len(tokens):
                 s, e, a = tokens[i]
@@ -85,17 +134,26 @@ class CitationDetector:
                     s2, e2, b = tokens[i + 1]
                     if self.RANGE_GAP_RE.match(t[e:s2]):
                         if a <= b:
-                            citations.append(Citation(
+                            para_cites.append(Citation(
                                 idx, s, e2, list(range(a, b + 1)), True, t[s:e2]))
                         else:
-                            citations.append(Citation(
+                            para_cites.append(Citation(
                                 idx, s, e2, [a], True, t[s:e2],
                                 status=STATUS_AMBIGUOUS,
                                 note="Reversed range (start > end); left unchanged"))
                         i += 2
                         continue
-                citations.append(Citation(idx, s, e, [a], False, t[s:e]))
+                para_cites.append(Citation(idx, s, e, [a], False, t[s:e]))
                 i += 1
+            for c in para_cites:
+                if c.status == STATUS_PENDING and any(
+                        fs < c.end and c.start < fe for fs, fe in in_field):
+                    c.status = STATUS_AMBIGUOUS
+                    c.note = ("Citation is part of a field result (e.g. an "
+                              "EndNote/Zotero/Mendeley citation or a "
+                              "cross-reference); left unchanged so the field "
+                              "keeps working")
+            citations.extend(para_cites)
             # Markers inside hyperlinks: report as AMBIGUOUS, never modify.
             for hl in p._p.iter(qn("w:hyperlink")):
                 hl_text = "".join(tt.text or "" for tt in hl.iter(qn("w:t")))

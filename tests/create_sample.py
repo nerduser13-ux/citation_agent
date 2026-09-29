@@ -9,7 +9,12 @@ The sample intentionally includes:
   * a PRE-EXISTING manual footnote in the introduction (must be preserved)
   * one reference with NO url (-> reported as missing URL)
   * one reference that is never cited (-> reported as uncited)
+
+Usage:
+    python tests/create_sample.py              # writes input/sample.docx
+    python tests/create_sample.py OUT.docx     # writes OUT.docx instead
 """
+import sys
 from pathlib import Path
 
 from lxml import etree
@@ -78,7 +83,8 @@ def add_preexisting_footnote(doc, paragraph, text):
     paragraph._p.append(run)
 
 
-def main():
+def main(out=OUT):
+    out = Path(out)
     doc = Document()
 
     doc.add_paragraph("Sample Academic Paper").runs[0].bold = True
@@ -123,10 +129,10 @@ def main():
     for rtext in refs:
         doc.add_paragraph(rtext)
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(OUT))
-    print("Wrote sample document:", OUT)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
+    print("Wrote sample document:", out)
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1] if len(sys.argv) > 1 else OUT)

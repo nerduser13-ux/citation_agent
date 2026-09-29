@@ -28,6 +28,10 @@ class Config:
     # (e.g. document_with_footnotes_1.docx) unless this is True.
     overwrite_output: bool = False
 
+    # --- Set by main.run() ----------------------------------------------------
+    resolved_output_path: Path = None   # output path actually used
+    report_path: Path = None            # CSV review report actually written
+
     # --- Reference-section detection ------------------------------------------
     # Keyword phrases a reference-section heading may consist of (case-insensitive).
     reference_keywords: tuple = (
@@ -48,7 +52,7 @@ class Config:
         if self.output_path:
             out = Path(self.output_path)
         else:
-            out = self.output_dir / (src.stem + "_with_footnotes" + src.suffix)
+            out = Path(self.output_dir) / (src.stem + "_with_footnotes" + src.suffix)
         if out.resolve() == src.resolve():
             raise ValueError(
                 "Output path is identical to the input path; refusing to touch the "

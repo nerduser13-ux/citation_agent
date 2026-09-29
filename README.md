@@ -50,7 +50,7 @@ citation_agent/
 └── tests/
     ├── create_sample.py   # builds a realistic sample .docx (incl. a manual footnote)
     ├── validate_sample.py # deep checks of the sample output (OOXML level)
-    └── test_pipeline.py   # pytest end-to-end suite (39 tests)
+    └── test_pipeline.py   # pytest end-to-end suite (48 tests)
 ```
 
 ## Requirements
@@ -156,7 +156,8 @@ The heading is matched generically, most-conservative-first:
    confidently identified`. It never guesses.
 
 A short body sentence that merely contains a keyword (e.g. "Our data sources
-were collected …") is **not** treated as a heading.
+were collected …") is **not** treated as a heading, and neither is a table
+cell (e.g. a bold "Reference" / "Sources" column header in an appendix table).
 
 ### Reference parsing rules
 
@@ -164,6 +165,15 @@ were collected …") is **not** treated as a heading.
 * A line starting with a year (`2020. …`) is **not** a numbered entry; it ends
   the current entry (its URLs must not be attributed to a reference number).
 * Wrapped continuation lines are appended to the current entry.
+* The list ends at the next styled heading **or** at a bold-only heading line
+  (short, entirely bold, not itself a numbered entry — e.g. "Appendix A" in a
+  document that formats headings with direct bold). Otherwise a following
+  section would be glued onto the last entry and its URLs attributed to that
+  reference. Consequence: bold category sub-headings *inside* a reference
+  list ("Books", "Web sources") also end it; later citations are then
+  reported as unresolved, never mis-linked.
+* Decimal Word auto-numbering (`w:numPr` on the paragraph) is read as the
+  entry number when the number is not typed in the text.
 * Duplicate numbers: the first occurrence wins (warning recorded).
 * Only explicit `http(s)://` URLs are extracted. Trailing sentence
   punctuation (`. , ; : ! ?`) is stripped from the end of a URL.
@@ -178,8 +188,15 @@ A citation marker is modified only when **all** of the following hold:
 1. it lies entirely inside a **single direct run** of the paragraph,
 2. that run contains **only text** (its children are exclusively
    `w:rPr`/`w:t` — no fields, drawings, OLE objects, tabs, breaks, or inline
-   content controls),
-3. its number exists in the reference section **and** that reference has an
+   content controls). The one exception is `w:lastRenderedPageBreak`, Word's
+   content-free layout-cache hint present in almost every multi-page
+   document: it is allowed and re-emitted before exactly the same character
+   (the validator checks its count is unchanged),
+3. the run is **not part of a complex field** (between `fldChar` begin and
+   end — how EndNote, Zotero and Mendeley Desktop store `[1]`, and how
+   cross-references work; a footnote placed there would be lost or break the
+   field on the next refresh),
+4. its number exists in the reference section **and** that reference has an
    explicit URL.
 
 Otherwise the marker is left byte-for-byte untouched and reported:
@@ -188,7 +205,7 @@ Otherwise the marker is left byte-for-byte untouched and reported:
 | --- | --- |
 | `SUCCESS` | footnote(s) inserted |
 | `ERROR` | reference number missing, or reference has no URL (unresolved) |
-| `AMBIGUOUS` | split across runs / inside hyperlink / complex run / reversed range |
+| `AMBIGUOUS` | split across runs / inside hyperlink / inside a field result / complex run / reversed range |
 | `SKIPPED` | already processed by a previous run of this tool |
 
 Specifically, markers inside `<w:hyperlink>`, fields, or runs containing
@@ -275,6 +292,10 @@ Unresolved citations, Missing URLs, Ambiguous citations, Uncited references,
 Previously processed, Output valid, Reopened with python-docx, All footnote
 URLs from refs, Input unchanged, Status.
 
+"Uncited references" are references never cited in the body. A reference
+whose markers were found but could not be processed (`AMBIGUOUS` / `ERROR`)
+counts as cited — it shows up in those rows instead.
+
 ## Windows / Microsoft Word COM backend
 
 ```bash
@@ -282,18 +303,26 @@ pip install pywin32
 python main.py --input thesis.docx --backend com
 ```
 
-Opens the document in Microsoft Word, inserts genuine footnotes via the Word
-object model (one Find per citation, in document order), deletes the marker
-text when replacing, and `SaveAs`-es to the output path (input untouched).
+Opens the document in Microsoft Word, finds each marker (one `Find` per
+citation, in document order, with all sticky Find options reset), validates
+every reference number *before* touching the text, deletes the marker when
+replacing, inserts automatically numbered footnotes with
+`Footnotes.Add(Range=…, Text=url)` at a collapsed range (each one after the
+previous reference mark, so `[4]-[6]` stays in order), and `SaveAs`-es to the
+output path (input untouched). Markers classified unsafe by the detector are
+found and stepped over, never modified.
+
 The **experimental** backend is Windows-only and was **not executed** in the
-Linux build/test environment (it fails loudly on other platforms); the XML
+Linux build/test environment (it fails loudly on other platforms); it follows
+the documented Word object model but has not been run against Word. The XML
 backend is the validated default and is what the test suite exercises.
 
 ## Tests
 
 ```bash
-python -m pytest tests/ -v                 # 39 end-to-end tests (OOXML-level)
+python -m pytest tests/ -v                 # 48 end-to-end tests (OOXML-level)
 python tests/create_sample.py              # (re)generate input/sample.docx
+                                           #   (or: create_sample.py OUT.docx)
 python main.py                             # process the sample
 python tests/validate_sample.py            # deep checks of the sample output
 ```
@@ -311,7 +340,17 @@ modes); input hash unchanged; non-standard headings ("Bibliography",
 "5. References", bold unstyled "Works Cited"); block fallback without
 heading; keyword-sentence false-positive avoidance; abort when no reference
 section; keep-marker mode; output-collision safe naming; `--overwrite`;
-output==input rejection; COM backend rejection on Linux; sample end-to-end.
+output==input rejection; COM backend rejection on Linux; sample end-to-end
+(generated into a temp dir — running the suite never modifies tracked files).
+
+Regression tests for issues found on real Word documents: runs carrying
+`w:lastRenderedPageBreak` (8 layouts × both modes, checked against an oracle
+for exact hint placement); citation in a block-level content control; bold
+"Appendix" heading after the list must not leak its URL into the last
+reference; bold "Reference" table header not taken as the reference heading;
+EndNote-style field result left untouched; "uncited" excludes references
+cited by unprocessed markers; `agent_tools.run_pipeline` returns the real
+(collision-safe) output path; `w:vertAlign` inserted in schema order.
 
 The sample document deliberately includes: a heading-based reference section,
 inline/multiple/repeated/range citations, a citation inside a bold run, a
@@ -331,6 +370,13 @@ footnote**, one reference with **no URL** (reported unresolved), and one
   re-run may add another footnote (conservative, documented behavior).
 * **`[n]` inside a reference entry that has no URL** and other
   unresolvable markers are left in place by design (never invented).
+* **Style-linked list numbering** (entries numbered only via a paragraph
+  style such as "List Number", with no `w:numPr` on the paragraph itself) is
+  not read: such a list yields no references and every citation is reported
+  unresolved. Direct list numbering (the usual Numbering button) works.
+* Markers inside **tracked insertions** (`w:ins`), simple fields
+  (`w:fldSimple`) or smart tags are, like inline content controls, outside
+  the direct-run coordinate space: never modified, not reported.
 * **COM backend** is experimental, Windows-only, and untested here; prefer
   the XML backend.
 * The tool operates on the **first document part only** (`word/document.xml`);

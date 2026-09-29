@@ -83,7 +83,13 @@ def run_pipeline(input_path, output_path=None, backend="xml",
                  keep_marker=False, overwrite=False,
                  input_dir="input", output_dir="output"):
     """One-call deterministic pipeline (the only way an agent may produce a
-    modified document). Returns (exit_code, output_path, report_path)."""
+    modified document). Returns (exit_code, output_path, report_path).
+
+    ``output_path`` is the file actually written - including the
+    collision-safe ``..._with_footnotes_1.docx`` name - or None when no
+    document was produced (e.g. aborted: reference section not found).
+    ``report_path`` is None when no report was written (usage errors)."""
+    from pathlib import Path
     from main import run  # local import: keep module import side-effect free
 
     config = Config()
@@ -92,10 +98,10 @@ def run_pipeline(input_path, output_path=None, backend="xml",
     config.backend = backend
     config.replace_marker = not keep_marker
     config.overwrite_output = overwrite
-    config.input_dir = input_dir
-    config.output_dir = output_dir
-    from pathlib import Path
+    config.input_dir = Path(input_dir)
+    config.output_dir = Path(output_dir)
     code = run(config)
-    out = config.output_path or str(
-        Path(output_dir) / (Path(input_path).stem + "_with_footnotes.docx"))
-    return code, out, Path(out).with_name("citation_review_report.csv")
+    out = config.resolved_output_path
+    if out is not None and not Path(out).is_file():
+        out = None
+    return code, out, config.report_path

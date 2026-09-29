@@ -44,7 +44,7 @@ def original_unchanged(path, original_hash) -> bool:
 _STRUCTURAL_TAGS = (
     "w:p", "w:tbl", "w:hyperlink", "w:bookmarkStart", "w:bookmarkEnd",
     "w:fldChar", "w:drawing", "w:sdt", "w:object", "w:pgSz", "w:sectPr",
-    "w:ins", "w:del", "w:pPr",
+    "w:ins", "w:del", "w:pPr", "w:lastRenderedPageBreak",
 )
 
 

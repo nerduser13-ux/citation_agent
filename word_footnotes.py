@@ -12,7 +12,9 @@ Two backends:
 Surgical-editing principles:
   * We never rebuild a whole paragraph. Only the single ``<w:r>`` run that
     actually contains a citation marker is replaced - and only when that run
-    is "simple" (its children are exclusively ``w:rPr``/``w:t``). Every other
+    is "simple" (its children are exclusively ``w:rPr``/``w:t``, plus Word's
+    content-free ``w:lastRenderedPageBreak`` hint, which is re-emitted at its
+    exact character position). Every other
     paragraph child (bookmarks, hyperlinks, fields, drawings, proof errors,
     content controls) is left exactly where it is, in the same order.
   * Splitting happens at the text level: the marker's before/after pieces are
@@ -21,9 +23,10 @@ Surgical-editing principles:
   * The footnote-reference run keeps the original run's character formatting,
     gains the FootnoteReference character style, and is explicitly marked
     superscript so Word renders the footnote reference correctly.
-  * A marker that spans runs, or sits inside a hyperlink / a run containing a
-    drawing / field / object / other non-text content, is NOT modified - it is
-    reported AMBIGUOUS instead of risking corruption.
+  * A marker that spans runs, or sits inside a hyperlink / a complex-field
+    result (reference-manager citation) / a run containing a drawing / field /
+    object / other non-text content, is NOT modified - it is reported
+    AMBIGUOUS instead of risking corruption.
   * Idempotency: a marker immediately flanked by a footnote reference whose
     content equals one of the citation's own URLs is treated as previously
     processed (SKIPPED); unrelated pre-existing footnotes never cause a skip.
@@ -140,13 +143,26 @@ def _set_rstyle(rpr, style_id):
     return rpr
 
 
+# CT_RPr children that the OOXML schema places AFTER w:vertAlign. w:rPr is a
+# strict sequence; appending vertAlign after e.g. w:lang (present in most
+# Word-authored runs) produces a schema-invalid run property list.
+_AFTER_VERTALIGN = tuple(
+    qn(f"w:{name}")
+    for name in (
+        "rtl", "cs", "em", "lang", "eastAsianLayout", "specVanish",
+        "oMath", "rPrChange",
+    )
+)
+
+
 def _set_superscript(rpr):
     """Add/replace w:vertAlign so the run is explicitly superscript.
 
     This is important for the footnote reference marker. Word normally
     renders a footnoteReference as superscript, but explicitly writing
     w:vertAlign makes the OOXML unambiguous and avoids relying on the
-    document's style definitions.
+    document's style definitions. A new element is inserted at its
+    schema-correct position within w:rPr.
     """
     if rpr is None:
         rpr = OxmlElement("w:rPr")
@@ -155,29 +171,66 @@ def _set_superscript(rpr):
 
     if vert_align is None:
         vert_align = OxmlElement("w:vertAlign")
-        rpr.append(vert_align)
+        follower = next(
+            (child for child in rpr if child.tag in _AFTER_VERTALIGN),
+            None,
+        )
+        if follower is not None:
+            follower.addprevious(vert_align)
+        else:
+            rpr.append(vert_align)
 
     vert_align.set(qn("w:val"), "superscript")
 
     return rpr
 
 
-def make_text_run(text, rpr):
+def _make_t(text):
+    t = OxmlElement("w:t")
+    t.set(qn("xml:space"), "preserve")
+    t.text = text
+    return t
+
+
+def make_text_run(text, rpr, anchors=()):
     """Create a plain text run.
 
     The original rPr is deep-copied so modifying the new run never modifies
     the original source run.
+
+    ``anchors`` is an optional list of ``(offset, element)`` pairs (offsets
+    local to ``text``, in document order): zero-width run children such as
+    ``w:lastRenderedPageBreak`` that are re-emitted exactly before the
+    character they originally preceded.
     """
     r = OxmlElement("w:r")
 
     if rpr is not None:
         r.append(copy.deepcopy(rpr))
 
-    t = OxmlElement("w:t")
-    t.set(qn("xml:space"), "preserve")
-    t.text = text
+    prev = 0
 
-    r.append(t)
+    for off, el in anchors:
+        if off > prev:
+            r.append(_make_t(text[prev:off]))
+            prev = off
+        r.append(copy.deepcopy(el))
+
+    if prev < len(text):
+        r.append(_make_t(text[prev:]))
+
+    return r
+
+
+def make_anchor_run(anchor, rpr):
+    """A run holding only a zero-width element whose text position was
+    removed (it sat inside a replaced marker) - so it is never dropped."""
+    r = OxmlElement("w:r")
+
+    if rpr is not None:
+        r.append(copy.deepcopy(rpr))
+
+    r.append(copy.deepcopy(anchor))
 
     return r
 
@@ -396,19 +449,42 @@ class XmlFootnoteBackend:
 # Safety helpers
 # --------------------------------------------------------------------------
 
+# Zero-width run children that carry no content and may travel with a split.
+# w:lastRenderedPageBreak is Word's layout-cache hint ("a page break fell here
+# when the file was last saved"); Word writes it into practically every
+# multi-page document, so treating it as unsafe content would leave a large
+# share of real citations unprocessed. It is preserved at its exact position.
+_ZERO_WIDTH_RUN_CHILDREN = (qn("w:lastRenderedPageBreak"),)
+
+_SIMPLE_RUN_CHILDREN = (qn("w:rPr"), qn("w:t")) + _ZERO_WIDTH_RUN_CHILDREN
+
+
 def _run_is_simple(run_elem):
-    """Return True only for runs containing rPr/t children.
+    """Return True only for runs containing rPr/t children (plus zero-width
+    layout hints, see ``_ZERO_WIDTH_RUN_CHILDREN``).
 
     Runs containing drawings, fields, breaks, tabs, objects, etc. are not safe
     to split.
     """
     return all(
-        child.tag in (
-            qn("w:rPr"),
-            qn("w:t"),
-        )
+        child.tag in _SIMPLE_RUN_CHILDREN
         for child in run_elem
     )
+
+
+def _zero_width_anchors(run_elem):
+    """``[(text_offset, element)]`` for the run's zero-width children, in
+    document order (offsets are measured over the run's w:t text)."""
+    anchors = []
+    pos = 0
+
+    for child in run_elem:
+        if child.tag == qn("w:t"):
+            pos += len(child.text or "")
+        elif child.tag in _ZERO_WIDTH_RUN_CHILDREN:
+            anchors.append((pos, child))
+
+    return anchors
 
 
 def _is_ref_run(run_elem):
@@ -633,6 +709,11 @@ def _build_run_replacement(
 
     Footnote reference runs preserve the original formatting but explicitly
     receive the FootnoteReference style and superscript formatting.
+
+    Zero-width children (w:lastRenderedPageBreak) are re-emitted before the
+    same character they preceded in the original run. One that sat inside a
+    replaced marker is kept as its own run where the marker was, and one at
+    the very end of the run stays at the end - none is ever dropped.
     """
 
     text = "".join(
@@ -641,6 +722,27 @@ def _build_run_replacement(
     )
 
     rpr = run_elem.find(qn("w:rPr"))
+
+    anchors = _zero_width_anchors(run_elem)
+    placed = set()
+
+    def take_anchors(lo, hi, include_hi=False):
+        """Claim not-yet-placed anchors with lo <= offset < hi (or <= hi)."""
+        out = []
+        for i, (off, el) in enumerate(anchors):
+            if i in placed:
+                continue
+            if lo <= off < hi or (include_hi and off == hi):
+                placed.add(i)
+                out.append((off, el))
+        return out
+
+    def text_run(lo, hi, include_hi=False):
+        return make_text_run(
+            text[lo:hi],
+            rpr,
+            [(off - lo, el) for off, el in take_anchors(lo, hi, include_hi)],
+        )
 
     new_elems = []
 
@@ -655,30 +757,21 @@ def _build_run_replacement(
         # Text before citation.
         # --------------------------------------------------------------
 
-        before = text[pos:ls]
-
-        if before:
-            new_elems.append(
-                make_text_run(
-                    before,
-                    rpr,
-                )
-            )
+        if ls > pos:
+            new_elems.append(text_run(pos, ls))
 
         # --------------------------------------------------------------
-        # Keep [n] marker if requested.
+        # Keep [n] marker if requested (otherwise it disappears, and any
+        # zero-width element that sat inside it stays at this position).
         # --------------------------------------------------------------
 
         if not replace_marker:
-            marker = text[ls:le]
-
-            if marker:
-                new_elems.append(
-                    make_text_run(
-                        marker,
-                        rpr,
-                    )
-                )
+            if le > ls:
+                new_elems.append(text_run(ls, le))
+        else:
+            new_elems.extend(
+                make_anchor_run(el, rpr) for _off, el in take_anchors(ls, le)
+            )
 
         # --------------------------------------------------------------
         # Genuine Word footnote references.
@@ -699,15 +792,15 @@ def _build_run_replacement(
     # Text after the last citation.
     # ------------------------------------------------------------------
 
-    after = text[pos:]
+    if pos < len(text):
+        new_elems.append(text_run(pos, len(text), include_hi=True))
 
-    if after:
-        new_elems.append(
-            make_text_run(
-                after,
-                rpr,
-            )
-        )
+    # Anything still unplaced sat at the very end of a run that ended with
+    # a citation marker: keep it at the end.
+    new_elems.extend(
+        make_anchor_run(el, rpr)
+        for _off, el in take_anchors(0, len(text), include_hi=True)
+    )
 
     return new_elems
 
@@ -729,6 +822,20 @@ def process_document_com(
       - Windows
       - Microsoft Word
       - pywin32
+
+    EXPERIMENTAL - not executable in the Linux build/test environment. Written
+    against the documented Word object model:
+      * ``Range.Find.Execute()`` redefines the *Range itself* to the match
+        (the Find object has no Range property);
+      * ``Footnotes.Add(Range, Reference, Text)`` - the 2nd positional
+        argument is a *custom reference mark*, so the URL is passed as
+        ``Text=`` to get an automatically numbered footnote.
+
+    Markers are matched by text search in document order. Every positioned
+    citation - including ones classified AMBIGUOUS / SKIPPED - is searched
+    for, so the search cursor stays aligned with the detector's sequence and a
+    later identical marker is never matched to an earlier, unsafe occurrence.
+    Citations inside hyperlinks (no position) are not searched for.
     """
 
     if os.name != "nt":
@@ -753,17 +860,12 @@ def process_document_com(
         try:
             last_pos = 0
 
-            for c in sorted(
-                (
-                    c
-                    for c in citations
-                    if c.status == "pending"
-                ),
-                key=lambda c: (
-                    c.para_index,
-                    max(0, c.start),
-                ),
-            ):
+            positioned = sorted(
+                (c for c in citations if c.start >= 0),
+                key=lambda c: (c.para_index, c.start),
+            )
+
+            for c in positioned:
 
                 rng = doc.Range(
                     last_pos,
@@ -772,62 +874,75 @@ def process_document_com(
 
                 fnd = rng.Find
 
+                # Find options are sticky for the whole Word session (e.g. a
+                # user's earlier wildcard search would turn "[1]" into a
+                # character class) - set every relevant option explicitly.
                 fnd.ClearFormatting()
                 fnd.Text = c.marker_text
                 fnd.Forward = True
+                fnd.Wrap = 0                    # wdFindStop
+                fnd.Format = False
+                fnd.MatchCase = False
+                fnd.MatchWholeWord = False
+                fnd.MatchWildcards = False
+                fnd.MatchSoundsLike = False
+                fnd.MatchAllWordForms = False
 
                 if not fnd.Execute():
-                    c.status = "AMBIGUOUS"
-                    c.note = (
-                        "Marker not found by Word COM; "
-                        "left unchanged"
-                    )
+                    if c.status == "pending":
+                        c.status = "AMBIGUOUS"
+                        c.note = (
+                            "Marker not found by Word COM; "
+                            "left unchanged"
+                        )
                     continue
 
-                found = fnd.Range
+                # ``rng`` now spans exactly the matched marker text.
+                if c.status != "pending":
+                    last_pos = rng.End      # unsafe marker: step over it
+                    continue
 
-                ok = True
+                # Validate every number BEFORE touching the document so a
+                # range with one bad number never gets partial footnotes.
+                bad = next(
+                    (n for n in c.numbers
+                     if not ref_map.get(n, {}).get("url")),
+                    None,
+                )
+
+                if bad is not None:
+                    c.status = "ERROR"
+                    c.note = (
+                        f"Reference {bad} "
+                        + (
+                            "not found in reference section"
+                            if bad not in ref_map
+                            else "has no URL in its entry"
+                        )
+                    )
+                    last_pos = rng.End
+                    continue
+
+                # Remove the marker first (replace mode), then insert every
+                # footnote at a collapsed range, each one AFTER the previous
+                # reference mark, so [4]-[6] yields refs 4, 5, 6 in order.
+                if replace_marker:
+                    pos = rng.Start
+                    rng.Delete()
+                else:
+                    pos = rng.End
 
                 for num in c.numbers:
-
-                    url = ref_map.get(
-                        num,
-                        {},
-                    ).get(
-                        "url"
+                    fn = doc.Footnotes.Add(
+                        Range=doc.Range(pos, pos),
+                        Text=ref_map[num]["url"],
                     )
+                    pos = fn.Reference.End
 
-                    if not url:
-                        ok = False
+                last_pos = pos
 
-                        c.note = (
-                            f"Reference {num} "
-                            + (
-                                "not found in reference section"
-                                if num not in ref_map
-                                else "has no URL in its entry"
-                            )
-                        )
-
-                        break
-
-                    doc.Footnotes.Add(
-                        found,
-                        url,
-                    )
-
-                if ok:
-
-                    if replace_marker:
-                        found.Delete()
-
-                    last_pos = found.End + 1
-
-                    c.status = "SUCCESS"
-                    c.note = "COM footnote inserted"
-
-                else:
-                    c.status = "ERROR"
+                c.status = "SUCCESS"
+                c.note = "COM footnote inserted"
 
             doc.SaveAs(
                 os.path.abspath(out_path)

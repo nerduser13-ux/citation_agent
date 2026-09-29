@@ -23,7 +23,13 @@ Detection strategy (most conservative guess wins; ambiguity aborts):
 5. Nothing else: None -> the caller must abort safely (no partial output).
 
 When several candidates exist, the LAST one in document order wins (reference
-sections sit at the end of the document by convention).
+sections sit at the end of the document by convention). Paragraphs inside
+table cells are never heading candidates (a bold "Reference" column header in
+an appendix table must not take over).
+
+The reference list ends at the next styled heading or bold-only heading line
+(see ``parse_references``), so a following section's URLs are never
+attributed to the last reference.
 
 URL selection rule when an entry contains several URLs (deterministic,
 documented): the LAST URL that is not a DOI resolver (no "doi.org" in the URL);
@@ -32,7 +38,7 @@ except a single run of trailing sentence punctuation (.,;:!? ) is stripped.
 """
 import re
 
-from document_reader import is_heading, is_style_heading, raw_text_of
+from document_reader import in_table, is_heading, is_style_heading, raw_text_of
 from docx.oxml.ns import qn
 
 # A reference entry line begins with "1.", "1)", "1 ", or "[1]" (then a space).
@@ -90,10 +96,13 @@ class ReferenceParser:
         keywords = tuple(k.lower() for k in cfg.reference_keywords)
 
         # --- 1+2: exact keyword headings (styled preferred) -------------
+        # Table cells are never section headings: a bold "Reference" /
+        # "Sources" column header (e.g. a literature matrix in an appendix)
+        # must not be mistaken for the reference-section heading.
         candidates = []          # (index, method)
         for i, p in enumerate(paragraphs):
             text = (p.text or "").strip()
-            if not text:
+            if not text or in_table(p):
                 continue
             if not (is_style_heading(p) or is_heading(p)):
                 continue
@@ -109,7 +118,7 @@ class ReferenceParser:
         # --- 3: keyword-containing heading + qualifying block ------------
         for i, p in enumerate(paragraphs):
             text = (p.text or "").strip()
-            if not text or not is_style_heading(p):
+            if not text or not is_style_heading(p) or in_table(p):
                 continue
             norm = _normalize_heading(text)
             if not any(k in norm for k in keywords):
@@ -172,6 +181,8 @@ class ReferenceParser:
             if _is_entry_line(t):
                 entries += 1
                 urls += len(_extract_urls(t))
+            elif is_heading(p):
+                break   # bold-only heading: the numbered block is over
             j += 1
         return _Block(start, j, entries, urls)
 
@@ -180,7 +191,13 @@ class ReferenceParser:
     # ------------------------------------------------------------------
     def parse_references(self, paragraphs, start_index):
         """Extract number -> {url, text} for the reference entries from
-        ``start_index`` to the next styled heading (or end of document).
+        ``start_index`` to the next heading (or end of document).
+
+        The list ends at the next styled heading, or at a bold-only heading
+        line (short, entirely bold, not itself a numbered entry) - documents
+        formatted with direct bold instead of heading styles would otherwise
+        glue a following section (e.g. "Appendix A") onto the last entry and
+        attribute that section's URLs to the last reference.
 
         Rules:
           * continuation (indented/wrapped) lines are appended to the current
@@ -206,6 +223,8 @@ class ReferenceParser:
                 label = self._automatic_number(p, list_counters)
                 if label is not None:
                     num, t = label, f"{label}. {t}"
+            if num is None and is_heading(p):
+                break   # bold-only heading: the reference list is over
             if num is not None:
                 if num in entries:
                     self.warnings.append(

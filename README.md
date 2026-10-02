@@ -20,7 +20,10 @@ authoritative number → source-URL mapping.
   hyperlinks, bookmarks, fields, drawings, images, headers, footers, page
   layout, section breaks, content controls, existing footnotes and all other
   unrelated OOXML are preserved.
-* Markers that cannot be safely modified (split across runs, inside a
+* Markers that Word stored in several pieces ("runs" - after an edit, a
+  spell-check mark or its hidden `_GoBack` bookmark) are processed when every
+  piece is plain text. Markers that cannot be safely modified (interrupted by
+  a tab, picture or link, partly hidden or struck through, inside a
   hyperlink, inside a field/drawing/complex run, reversed ranges) are
   reported as `AMBIGUOUS` and left **completely untouched**.
 * Re-running on an already-processed file does **not** create duplicate
@@ -62,7 +65,7 @@ citation_agent/
 └── tests/
     ├── create_sample.py   # builds a realistic sample .docx (incl. a manual footnote)
     ├── validate_sample.py # deep checks of the sample output (OOXML level)
-    ├── test_pipeline.py   # pytest end-to-end suite (62 tests)
+    ├── test_pipeline.py   # pytest end-to-end suite (75 tests)
     └── test_agent.py      # agent, AIs, tools, link checker, fully offline (106 tests)
 ```
 
@@ -350,7 +353,8 @@ replacement links.
 * `[1-3]`, `[1–3]`, `[1, 3-5]` — ranges inside one bracket, expanded
   (`[1, 3-5]` → references 1, 3, 4, 5 → four footnotes)
 * `[1]-[3]`, `[1]–[3]` (en dash), `[1]—[3]` (em dash) — ranges, expanded
-  (`[4]-[6]` → references 4, 5, 6 → three footnotes)
+  (`[4]-[6]` → references 4, 5, 6 → three footnotes). Unicode hyphens and
+  the minus sign (from text pasted out of PDFs or web pages) count as dashes.
 * `[1], [2]`, `[1]; [2]`, `[1] [2]`, `[1][2]` — separate brackets cited together
 * `[1] and [2]`, `[1], [2], and [3]` — multiple distinct citations
 * `[2] … [2]` — repeated citation numbers (each occurrence gets a footnote)
@@ -376,6 +380,9 @@ a space between them, formatted like the footnote numbers:
   field, tab or existing footnote. In `--keep-marker` mode nothing is
   removed: `[1], [2]` becomes `[1]¹, [2]²` and `[1,2]` becomes `[1,2]¹ ²`.
 * The separator can be changed with `--separator` (see the options above).
+* **The order of the numbers in the text does not matter.** Each number is
+  looked up in the reference list on its own, so a document may start with
+  `[3]-[4]`; it simply becomes footnotes ¹ ² holding references 3 and 4.
 * A citation is all-or-nothing: if one of its numbers has no reference or no
   link (`[1,9]`), the whole marker stays as it is and is reported as `ERROR`
   (in `[1], [9]` only `[9]` stays). Reversed ranges (`[3-1]`) and implausibly
@@ -426,8 +433,9 @@ cell (e.g. a bold "Reference" / "Sources" column header in an appendix table).
   reference. Consequence: bold category sub-headings *inside* a reference
   list ("Books", "Web sources") also end it; later citations are then
   reported as unresolved, never mis-linked.
-* Decimal Word auto-numbering (`w:numPr` on the paragraph) is read as the
-  entry number when the number is not typed in the text.
+* Decimal Word auto-numbering is read as the entry number when the number
+  is not typed in the text - set on the paragraph (the Numbering button) or
+  inherited from its style (e.g. "List Number").
 * Duplicate numbers: the first occurrence wins (warning recorded).
 * Only explicit `http(s)://` URLs are extracted. Trailing sentence
   punctuation (`. , ; : ! ?`) is stripped from the end of a URL.
@@ -439,8 +447,12 @@ cell (e.g. a bold "Reference" / "Sources" column header in an appendix table).
 
 A citation marker is modified only when **all** of the following hold:
 
-1. it lies entirely inside a **single direct run** of the paragraph,
-2. that run contains **only text** (its children are exclusively
+1. it lies in the **direct runs** of the paragraph - one run, or several
+   adjacent runs (Word splits typed text into runs for editing history,
+   spell-check marks, its hidden `_GoBack` bookmark or language tags) with
+   nothing between them but spell-check marks and bookmarks, none of them
+   hidden (`w:vanish`) or struck through,
+2. those runs contain **only text** (their children are exclusively
    `w:rPr`/`w:t` — no fields, drawings, OLE objects, tabs, breaks, or inline
    content controls). The one exception is `w:lastRenderedPageBreak`, Word's
    content-free layout-cache hint present in almost every multi-page
@@ -459,7 +471,7 @@ Otherwise the marker is left byte-for-byte untouched and reported:
 | --- | --- |
 | `SUCCESS` | footnote(s) inserted |
 | `ERROR` | reference number missing, or reference has no URL (unresolved) |
-| `AMBIGUOUS` | split across runs / inside hyperlink / inside a field result / complex run / reversed range |
+| `AMBIGUOUS` | interrupted by a tab, picture or link / partly hidden or struck through / inside hyperlink / inside a field result / complex run / reversed range |
 | `SKIPPED` | already processed by a previous run of this tool |
 
 Specifically, markers inside `<w:hyperlink>`, fields, or runs containing
@@ -576,7 +588,7 @@ rest of the test suite exercises.
 ## Tests
 
 ```bash
-python -m pytest tests/ -v                 # 168 tests: 62 pipeline (OOXML-level)
+python -m pytest tests/ -v                 # 181 tests: 75 pipeline (OOXML-level)
                                            #   + 106 agent / link checker (offline)
 python tests/create_sample.py              # (re)generate input/sample.docx
                                            #   (or: create_sample.py OUT.docx)
@@ -596,7 +608,10 @@ validator check that text removed while joining can only be `, `-style
 separators; the COM backend's logic through a fake Word object model;
 citation in bold text; citation in a table (incl. nested tables); hyperlink
 preservation; citation **inside** a hyperlink (untouched); citation **split
-across runs** (untouched); fields/bookmarks preservation; missing reference
+across runs** by editing history, spell-check marks or bookmarks (processed,
+each piece keeps its formatting) and split by a tab or link, partly hidden or
+struck through (untouched); every kind of dash in ranges; reference lists
+numbered by a list style; fields/bookmarks preservation; missing reference
 URL; missing reference number; uncited reference; reference section not
 scanned for citations; year-starting line not an entry; DOI-preference URL
 selection; bare DOI text never invented; pre-existing footnotes preserved;
@@ -653,10 +668,6 @@ footnote**, one reference with **no URL** (reported unresolved), and one
   re-run may add another footnote (conservative, documented behavior).
 * **`[n]` inside a reference entry that has no URL** and other
   unresolvable markers are left in place by design (never invented).
-* **Style-linked list numbering** (entries numbered only via a paragraph
-  style such as "List Number", with no `w:numPr` on the paragraph itself) is
-  not read: such a list yields no references and every citation is reported
-  unresolved. Direct list numbering (the usual Numbering button) works.
 * Markers inside **tracked insertions** (`w:ins`), simple fields
   (`w:fldSimple`) or smart tags are, like inline content controls, outside
   the direct-run coordinate space: never modified, not reported.

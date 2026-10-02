@@ -252,18 +252,46 @@ class ReferenceParser:
         return ref_map, self.warnings
 
     @staticmethod
+    def _style_num_pr(paragraph):
+        """w:numPr inherited from the paragraph's style (or a style it is
+        based on) - how Word's "List Number" style numbers a list."""
+        try:
+            style = paragraph.style
+        except Exception:             # malformed style definitions
+            return None
+        seen = set()
+        while style is not None and style.style_id not in seen:
+            seen.add(style.style_id)
+            ppr = style.element.pPr
+            num_pr = ppr.find(qn("w:numPr")) if ppr is not None else None
+            if num_pr is not None:
+                return num_pr
+            style = style.base_style
+        return None
+
+    @staticmethod
     def _automatic_number(paragraph, counters):
-        """Read decimal Word list labels that are absent from paragraph text."""
+        """Read decimal Word list labels that are absent from paragraph text.
+        The numbering may be set on the paragraph itself (the Numbering
+        button) or come from its style (e.g. "List Number")."""
         ppr = paragraph._p.pPr
-        num_pr = ppr.find(qn("w:numPr")) if ppr is not None else None
-        if num_pr is None:
+        direct = ppr.find(qn("w:numPr")) if ppr is not None else None
+        sources = [direct]
+        if direct is None or direct.find(qn("w:numId")) is None \
+                or direct.find(qn("w:ilvl")) is None:
+            sources.append(ReferenceParser._style_num_pr(paragraph))
+
+        def value(tag):                  # the paragraph's own setting wins
+            for src in sources:
+                el = src.find(qn(tag)) if src is not None else None
+                if el is not None:
+                    return el.get(qn("w:val"))
             return None
-        num_id_el = num_pr.find(qn("w:numId"))
-        if num_id_el is None:
+
+        num_id = value("w:numId")
+        if num_id in (None, "0"):        # numId 0 = numbering switched off
             return None
-        num_id = num_id_el.get(qn("w:val"))
-        level_el = num_pr.find(qn("w:ilvl"))
-        ilvl = int(level_el.get(qn("w:val"), "0")) if level_el is not None else 0
+        ilvl = int(value("w:ilvl") or 0)
         numbering = paragraph.part.numbering_part.element
         num = next((x for x in numbering.findall(qn("w:num"))
                     if x.get(qn("w:numId")) == num_id), None)

@@ -77,6 +77,17 @@ def direct_to_raw_map(p_elem):
     return spans
 
 
+def raw_position(spans, pos, end=False):
+    """Raw-text position of direct-run position ``pos`` (spans from
+    ``direct_to_raw_map``): where the character at ``pos`` starts, or with
+    ``end=True`` where the character before ``pos`` ends. These differ only
+    if non-run text (e.g. a hyperlink) lies between two runs."""
+    for d0, d1, r0, _r1 in spans:
+        if (d0 < pos <= d1) if end else (d0 <= pos < d1):
+            return r0 + (pos - d0)
+    return None
+
+
 def hyperlink_targets(doc) -> List[str]:
     """External target refs of every w:hyperlink in the body (rels resolved)."""
     part = doc.part
@@ -216,21 +227,20 @@ def validate_output(ctx: ValidationContext) -> dict:
         for c in cites_by_para.get(idx, []):
             if c.status != "SUCCESS" or c.start < 0:
                 continue
-            span = next(((d0, r0) for d0, d1, r0, _r1 in spans
-                         if d0 <= c.start and c.end <= d1), None)
-            if span is None:
-                misfit.append(f"para {idx}: {c.marker_text!r} is not inside one run")
+            # The marker may be stored in several runs; its raw text must be
+            # exactly the marker (nothing hidden in between, e.g. a link).
+            rs = raw_position(spans, c.start)
+            rend = raw_position(spans, c.end, end=True)
+            if rs is None or rend is None or original[rs:rend] != c.marker_text:
+                misfit.append(f"para {idx}: marker {c.marker_text!r} is not "
+                              "plain text in the paragraph")
                 continue
-            rs = span[1] + (c.start - span[0])
-            rend = span[1] + (c.end - span[0])
             between = sep * (len(c.numbers) - 1)     # footnote refs have no text
             if not ctx.replace_marker:
                 edits.append((rend, rend, between))  # refs follow the kept marker
             elif c.joined:
-                d0, r0 = next((d0, r0) for d0, d1, r0, _r1 in spans
-                              if d0 <= c.join_from <= d1)
-                gs = r0 + (c.join_from - d0)
-                if not JOIN_GAP_RE.fullmatch(original[gs:rs]):
+                gs = raw_position(spans, c.join_from, end=True)
+                if gs is None or not JOIN_GAP_RE.fullmatch(original[gs:rs]):
                     misfit.append(f"para {idx}: joined across text "
                                   f"{original[gs:rs]!r}")
                 edits.append((gs, rend, sep + between))

@@ -30,10 +30,17 @@ Surgical-editing principles:
     "[1][2]") are joined the same way in replace mode: the separator text
     between them is removed - also across Word's invisible run splits, but only
     through plain text runs, never across words, links, fields or footnotes.
-  * A marker that spans runs, or sits inside a hyperlink / a complex-field
-    result (reference-manager citation) / a run containing a drawing / field /
-    object / other non-text content, is NOT modified - it is reported
-    AMBIGUOUS instead of risking corruption.
+  * Word often stores one marker in several runs (editing history, a
+    spell-check mark, its hidden _GoBack bookmark, a language tag): "[3]" in
+    one run and "-[4]" in the next. Such a marker is processed when every
+    piece is plain, visible text and nothing but spell-check marks or
+    bookmarks sits between the pieces; its text is removed from each piece
+    and each piece keeps its own formatting for the text around the marker.
+  * A marker interrupted by a tab, picture, link or field, partly hidden or
+    struck through, or inside a hyperlink / a complex-field result
+    (reference-manager citation) / a run with a drawing, field, object or
+    other non-text content, is NOT modified - it is reported AMBIGUOUS
+    instead of risking corruption.
   * Idempotency: a marker immediately flanked by a footnote reference whose
     content equals one of the citation's own URLs is treated as previously
     processed (SKIPPED); unrelated pre-existing footnotes never cause a skip.
@@ -512,19 +519,15 @@ def _zero_width_anchors(run_elem):
 _JOIN_TRANSPARENT = (qn("w:proofErr"), qn("w:bookmarkStart"), qn("w:bookmarkEnd"))
 
 
-def _joinable(prev, cit, full):
-    """May citation ``cit`` be placed side by side with ``prev`` (removing the
-    text between them)? Only if that text is spaces plus at most one comma or
-    semicolon, and everything between the two host runs is plain text runs
-    (or spell-check marks / bookmarks) - never a link, field, tab, footnote..."""
-    if not JOIN_GAP_RE.fullmatch(full[prev.end:cit.start]):
-        return False
-    node = prev.host
-    while node is not cit.host:
+def _only_text_between(first, last):
+    """True if every sibling strictly between run elements ``first`` and
+    ``last`` is a plain text run or a spell-check mark / bookmark."""
+    node = first
+    while node is not last:
         node = node.getnext()
         if node is None:
             return False
-        if node is cit.host:
+        if node is last:
             break
         if node.tag == qn("w:r"):
             if not _run_is_simple(node):
@@ -532,6 +535,32 @@ def _joinable(prev, cit, full):
         elif node.tag not in _JOIN_TRANSPARENT:
             return False
     return True
+
+
+_ON = (None, "1", "true", "on")
+
+
+def _hides_or_strikes(run_elem):
+    """Hidden (w:vanish) or struck-through text changes what the reader sees,
+    so a marker partly made of it is not processed."""
+    rpr = run_elem.find(qn("w:rPr"))
+    if rpr is None:
+        return False
+    return any(
+        el is not None and el.get(qn("w:val")) in _ON
+        for el in (rpr.find(qn("w:vanish")), rpr.find(qn("w:strike")),
+                   rpr.find(qn("w:dstrike")))
+    )
+
+
+def _joinable(prev, cit, full):
+    """May citation ``cit`` be placed side by side with ``prev`` (removing the
+    text between them)? Only if that text is spaces plus at most one comma or
+    semicolon, and everything between the two host runs is plain text runs
+    (or spell-check marks / bookmarks) - never a link, field, tab, footnote..."""
+    if not JOIN_GAP_RE.fullmatch(full[prev.end:cit.start]):
+        return False
+    return _only_text_between(prev.host, cit.host)
 
 
 def _is_ref_run(run_elem):
@@ -591,30 +620,44 @@ def process_paragraph(
         if c.status != "pending":
             continue
 
-        host = None
+        # Every run the marker touches (Word may store "[3]-[4]" as
+        # "[3]" + "-[4]"), including runs without text inside it.
+        covering = [
+            ri for ri in run_info
+            if ri["start"] < c.end and c.start < ri["end"]
+        ]
 
-        for ri in run_info:
-            if (
-                c.start >= ri["start"]
-                and c.end <= ri["end"]
-            ):
-                host = ri
-                break
-
-        if host is None:
+        if not covering:
             c.status = "AMBIGUOUS"
-            c.note = (
-                "Citation spans multiple runs / not fully inside a single "
-                "run; left unchanged to preserve formatting"
-            )
+            c.note = "Citation not found in the paragraph's runs; left unchanged"
             continue
 
-        if not _run_is_simple(host["elem"]):
+        host = covering[-1]          # the footnote references go here
+
+        if len(covering) == 1:
+            if not _run_is_simple(host["elem"]):
+                c.status = "AMBIGUOUS"
+                c.note = (
+                    "Citation run contains non-text content "
+                    "(field/drawing/break/...); left unchanged"
+                )
+                continue
+        elif not all(_run_is_simple(ri["elem"]) for ri in covering):
             c.status = "AMBIGUOUS"
             c.note = (
-                "Citation run contains non-text content "
-                "(field/drawing/break/...); left unchanged"
+                "Citation is split by a tab, line break, picture or other "
+                "non-text element; left unchanged"
             )
+            continue
+        elif any(_hides_or_strikes(ri["elem"]) for ri in covering):
+            c.status = "AMBIGUOUS"
+            c.note = ("Citation is partly hidden or struck through; "
+                      "left unchanged")
+            continue
+        elif not _only_text_between(covering[0]["elem"], host["elem"]):
+            c.status = "AMBIGUOUS"
+            c.note = ("Citation is interrupted by a link, field or similar; "
+                      "left unchanged")
             continue
 
         # --------------------------------------------------------------
@@ -622,7 +665,7 @@ def process_paragraph(
         # --------------------------------------------------------------
 
         for sib in (
-            host["elem"].getprevious(),
+            covering[0]["elem"].getprevious(),
             host["elem"].getnext(),
         ):
             if sib is not None and _is_ref_run(sib):
@@ -654,8 +697,15 @@ def process_paragraph(
 
         c.host = host["elem"]
 
-        c.local_start = c.start - host["start"]
+        c.local_start = max(c.start, host["start"]) - host["start"]
         c.local_end = c.end - host["start"]
+
+        # The marker's text in earlier runs: removed in replace mode.
+        c.pieces = [
+            (ri["elem"], c.start - ri["start"] if c.start > ri["start"] else 0,
+             ri["end"] - ri["start"])
+            for ri in covering[:-1] if ri["end"] > ri["start"]
+        ]
 
     # ------------------------------------------------------------------
     # 2. Validate citation numbers and allocate footnote IDs.
@@ -705,6 +755,11 @@ def process_paragraph(
     cuts = defaultdict(list)            # run -> [(local_lo, local_hi)]
 
     if replace_marker:
+        for c in para_citations:        # pieces of markers split over runs
+            if c.status == "pending" and c.host is not None and c.fids:
+                for elem, lo, hi in c.pieces:
+                    cuts[elem].append((lo, hi))
+
         prev = None
         for c in sorted((c for c in para_citations if c.start >= 0),
                         key=lambda c: c.start):

@@ -456,10 +456,12 @@ def test_citation_inside_hyperlink_untouched(tmp_path):
     assert summary["Ambiguous_citations"] == "1"
 
 
-def test_citation_split_across_runs_untouched(tmp_path):
+def test_citation_split_across_runs_is_processed(tmp_path):
+    # Word often stores one marker in several runs (edited later, spell
+    # check, its _GoBack bookmark, a language tag): "[1" + "] for detail".
     doc = Document()
     p = doc.add_paragraph()
-    p.add_run("See [1")
+    p.add_run("See [1").italic = True
     p.add_run("] for detail. Safe [2].")
     doc.add_heading("References", level=1)
     for r in REFS:
@@ -469,14 +471,64 @@ def test_citation_split_across_runs_untouched(tmp_path):
     rc, _ = run_tool(src, tmp_path)
     assert rc == 0
     doc2, _z, ft = load(output_path(tmp_path))
-    assert len(regular(ft)) == 1  # only the safe [2]
-    urls = {fn_text(f) for f in regular(ft)}
-    assert urls == {"https://example.com/two"}
-    # the split marker must remain in two separate runs, untouched
-    body = body_text_before_refs(doc2)
-    assert "See [1" in body and "] for detail" in body
+    assert [fn_text(f) for f in regular(ft)] == ["https://example.com/one",
+                                                 "https://example.com/two"]
+    assert _shown(output_path(tmp_path))[0] == "See {1} for detail. Safe {2}."
+    runs = next(iter_paragraphs(doc2)).runs
+    assert runs[0].text == "See " and runs[0].italic      # its formatting kept
     _rows, summary = read_csv(tmp_path)
-    assert summary["Ambiguous_citations"] == "1"
+    assert summary["Ambiguous_citations"] == "0"
+
+
+def test_split_citations_that_are_still_left_alone(tmp_path):
+    def run(text, **props):
+        r = OxmlElement("w:r")
+        if props:
+            rpr = OxmlElement("w:rPr")
+            for tag in props:
+                rpr.append(OxmlElement(f"w:{tag}"))
+            r.append(rpr)
+        t = OxmlElement("w:t")
+        t.set(qn("xml:space"), "preserve")
+        t.text = text
+        r.append(t)
+        return r
+
+    doc = Document()
+    p1 = doc.add_paragraph()                     # interrupted by a tab
+    p1._p.append(run("A [3]"))
+    tab = OxmlElement("w:r")
+    tab.append(OxmlElement("w:tab"))
+    p1._p.append(tab)
+    p1._p.append(run("-[4] B"))
+    p2 = doc.add_paragraph()                     # interrupted by a link
+    p2._p.append(run("A [3"))
+    add_hyperlink(p2, "https://example.com/x", "x")
+    p2._p.append(run("] B"))
+    p3 = doc.add_paragraph()                     # partly hidden
+    p3._p.append(run("A [3]-"))
+    p3._p.append(run("[4]", vanish=True))
+    p3._p.append(run(" B"))
+    p4 = doc.add_paragraph()                     # partly struck through
+    p4._p.append(run("A [3]"))
+    p4._p.append(run("-[4]", strike=True))
+    p4._p.append(run(" B"))
+    doc.add_heading("References", level=1)
+    for r in REFS:
+        doc.add_paragraph(r)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    before = [raw_text_of(q._p) for q in (p1, p2, p3, p4)]
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    out_doc, _z, ft = load(output_path(tmp_path))
+    assert regular(ft) == []
+    assert [raw_text_of(q._p) for q in list(iter_paragraphs(out_doc))[:4]] == before
+    rows, summary = read_csv(tmp_path)
+    assert summary["Ambiguous_citations"] == "4"
+    notes = [r[7] for r in rows[1:] if len(r) > 7 and r[6] == "AMBIGUOUS"]
+    assert any("tab" in n for n in notes) and any("link" in n for n in notes)
+    assert any("hidden or struck" in n for n in notes)
 
 
 def test_field_and_bookmark_preserved(tmp_path):
@@ -914,8 +966,9 @@ def _oracle(runs, replace=True, sep=" ", valid=(1, 2, 3, 4), blocked=()):
     ``blocked``: indices k where something that is not plain text (a tab)
     sits between run k-1 and run k.
 
-    Rules: a marker is processed if it lies inside one run, is not a
-    reversed range and every number has a URL. Its footnote references stand
+    Rules: a marker is processed if it is not a reversed range, every
+    number has a URL and nothing that is not plain text sits inside it (it
+    may be spread over several runs). Its footnote references stand
     side by side with ``sep`` between them. In replace mode the marker
     disappears, and a processed citation that follows a processed citation
     with only spaces and one comma/semicolon between (and nothing blocking)
@@ -953,10 +1006,11 @@ def _oracle(runs, replace=True, sep=" ", valid=(1, 2, 3, 4), blocked=()):
         i += 1
     prev = None
     for c in cites:
-        c["host"] = next((k for k, (a, b) in enumerate(spans)
-                          if a <= c["start"] and c["end"] <= b), None)
-        c["ok"] = (not c["bad"] and c["host"] is not None
-                   and all(n in valid for n in c["nums"]))
+        over = [k for k, (a, b) in enumerate(spans)
+                if a < c["end"] and c["start"] < b]
+        c["host"] = over[-1]
+        c["ok"] = (not c["bad"] and all(n in valid for n in c["nums"])
+                   and not any(over[0] < k <= over[-1] for k in blocked))
         c["joined"] = bool(
             replace and c["ok"] and prev is not None
             and re.fullmatch(r" *[,;]? *", text[prev["end"]:c["start"]])
@@ -1155,10 +1209,11 @@ def test_citation_in_field_result_untouched(tmp_path):
 
 def test_uncited_excludes_unprocessed_citations(tmp_path):
     # A reference cited only by a marker that could not be processed
-    # (here: split across runs -> AMBIGUOUS) is still cited, not "uncited".
+    # (here: split by a tab -> AMBIGUOUS) is still cited, not "uncited".
     doc = Document()
     p = doc.add_paragraph()
     p.add_run("See [1] and [3")
+    p.add_run().add_tab()
     p.add_run("] split.")
     doc.add_heading("References", level=1)
     for r in REFS:
@@ -1338,13 +1393,14 @@ def test_joining_across_invisible_run_splits(tmp_path):
         ["A [1]", "<tab>", ", [2] B"],    # a tab is real content: not joined
         ["A [1]", "<link>", ", [2] B"],   # so is a link (its text is not in the
                                           # run text the markers are found in)
-        ["A [1", "], [2] B"],             # [1] split by formatting: left alone
+        ["A [1", "], [2] B"],             # [1] split over two runs: fine too
+        ["A [1", "<tab>", "], [2] B"],    # [1] split by a tab: left alone
     ])
     rc, _ = run_tool(src, tmp_path)
     assert rc == 0                         # incl. structural checks (bookmark, hint)
-    assert _shown(output_path(tmp_path))[:7] == [
+    assert _shown(output_path(tmp_path))[:8] == [
         "A {1} {2} B", "A {1} {2} B", "A {1}| {2} B", "A {1} {2} B",
-        "A {1}, {2} B", "A {1}link, {2} B", "A [1], {2} B"]
+        "A {1}, {2} B", "A {1}link, {2} B", "A {1} {2} B", "A [1], {2} B"]
 
 
 def test_never_joined_across_an_existing_footnote(tmp_path):
@@ -1576,3 +1632,79 @@ def test_com_backend_logic_with_a_fake_word(tmp_path, monkeypatch):
     by_text = {(c.para_index, c.marker_text): c for c in cites}
     assert by_text[(1, "[2]")].joined and by_text[(1, "[2]")].join_from == 5
     assert by_text[(3, "[9]")].status == "ERROR" and not by_text[(3, "[1]")].joined
+
+
+@pytest.mark.parametrize("dash", list("-\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"))
+def test_every_kind_of_dash_makes_a_range(tmp_path, dash):
+    # Text pasted from PDFs and web pages brings Unicode hyphens and minus
+    # signs; [3]‐[4] must not become footnote 3, a hyphen, footnote 4.
+    src = _paragraphs_doc(tmp_path / "t.docx", [f"model [3]{dash}[4].", f"also [1{dash}3]."])
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    assert _shown(output_path(tmp_path))[:2] == ["model {3} {4}.", "also {1} {2} {3}."]
+
+
+def _style_numbered_refs(doc, style="List Number"):
+    for r in REFS:
+        doc.add_paragraph(r.split(". ", 1)[1], style=style)   # number from the style
+
+
+def test_reference_list_numbered_by_a_list_style(tmp_path):
+    # Word's "List Number" style numbers the list without putting the number
+    # on the paragraph; such lists used to yield no references at all.
+    doc = Document()
+    doc.add_paragraph("Studies agree [1], [4].")
+    doc.add_heading("References", level=1)
+    _style_numbered_refs(doc)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    _rows, summary = read_csv(tmp_path)
+    assert summary["References_detected"] == "4"
+    assert _shown(output_path(tmp_path))[0] == "Studies agree {1} {4}."
+
+
+def test_numbering_switched_off_on_one_paragraph(tmp_path):
+    # numId 0 on the paragraph overrides the style: that line has no number
+    # and is read as the continuation of the entry before it.
+    doc = Document()
+    doc.add_paragraph("Studies agree [1], [3].")
+    doc.add_heading("References", level=1)
+    _style_numbered_refs(doc)
+    off = doc.paragraphs[-2]._p.get_or_add_pPr()          # the 3rd entry
+    num_pr = OxmlElement("w:numPr")
+    nid = OxmlElement("w:numId")
+    nid.set(qn("w:val"), "0")
+    num_pr.append(nid)
+    off.append(num_pr)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    from document_reader import DocumentReader
+    from config import Config
+    paras = DocumentReader(src).all_paragraphs()
+    start = ReferenceParser(Config()).find_reference_section(paras, Config())[0]
+    ref_map, _w = ReferenceParser().parse_references(paras, start)
+    assert sorted(ref_map) == [1, 2, 3]                    # 4 entries, 3 numbered
+    assert "Gamma" in ref_map[2]["text"] and "Delta" in ref_map[3]["text"]
+
+
+def test_validator_catches_a_marker_with_hidden_text_inside(tmp_path, monkeypatch):
+    # If processing ever accepted a marker with a link inside ("[3" + link +
+    # "]"), the validator, which looks at the raw text, must fail the output.
+    import word_footnotes
+    monkeypatch.setattr(word_footnotes, "_only_text_between", lambda a, b: True)
+    doc = Document()
+    p = doc.add_paragraph()
+    p.add_run("A [3")
+    add_hyperlink(p, "https://example.com/x", "x")
+    p.add_run("] B")
+    doc.add_heading("References", level=1)
+    for r in REFS:
+        doc.add_paragraph(r)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 1
+    _rows, summary = read_csv(tmp_path)
+    assert summary["Status"] == "VALIDATION FAILED"

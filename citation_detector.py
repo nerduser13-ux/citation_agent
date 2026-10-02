@@ -8,7 +8,7 @@ section itself is excluded). Supported marker syntax:
     [1-3]  [1–3]  [1, 3-5] (ranges inside one bracket)
     [1] and [2]
     [1], [2], and [3]
-    [1]-[3]      (hyphen)
+    [1]-[3]      (hyphen; also Unicode hyphens and the minus sign)
     [1]–[3]      (en dash)
     [1]—[3]      (em dash)
     [2] ... [2]  (repeated citations -> one Citation object per occurrence)
@@ -56,7 +56,10 @@ STATUS_AMBIGUOUS = "AMBIGUOUS"
 # Spaces that may appear inside a marker or between two markers of one group
 # (ordinary, no-break, thin, ... - but no tabs or line breaks).
 _SPACES = "[ \u00a0\u2000-\u200a\u202f\u205f\u3000]*"
-_DASH = "[-\u2013\u2014]"
+# Hyphen-minus, Unicode hyphen / non-breaking hyphen / figure dash, en dash,
+# em dash, horizontal bar, minus sign, small and full-width hyphen-minus:
+# text pasted from PDFs and web pages uses all of them.
+_DASH = "[-\u2010-\u2015\u2212\ufe63\uff0d]"
 _ITEM = rf"\d+(?:{_SPACES}{_DASH}{_SPACES}\d+)?"
 # [1]  [1,2]  [1, 2]  [1;2]  [1-3]  [1–3]  [1, 3-5]
 MARKER_RE = re.compile(rf"\[{_SPACES}{_ITEM}(?:{_SPACES}[,;]{_SPACES}{_ITEM})*{_SPACES}\]")
@@ -146,6 +149,7 @@ class Citation:
     joined: bool = False
     join_from: int = -1
     host = None              # run element containing the marker (set later)
+    pieces = ()              # (run, lo, hi): the marker's text in earlier runs
     local_start: int = 0
     local_end: int = 0
 
@@ -154,7 +158,7 @@ class CitationDetector:
     TOKEN_RE = MARKER_RE
     # Separator between two range tokens: optional whitespace, one dash
     # (hyphen, en dash or em dash), optional whitespace.
-    RANGE_GAP_RE = re.compile(r"^\s*[-\u2013\u2014]\s*$")
+    RANGE_GAP_RE = re.compile(rf"^\s*{_DASH}\s*$")
 
     def detect(self, paragraphs, ref_section_start):
         """Detect citation markers in body paragraphs only

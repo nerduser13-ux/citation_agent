@@ -143,8 +143,9 @@ STATUS_HELP = {
     "ERROR": ("Not changed: the reference number is missing from the reference "
               "list, or that reference has no link. Fix the reference list."),
     "AMBIGUOUS": ("Left unchanged for safety (e.g. the [n] is a hyperlink, a "
-                  "reference-manager field, or split by formatting). Add this "
-                  "footnote by hand in Word if needed."),
+                  "reference-manager field, interrupted by a tab, picture or "
+                  "link, or partly hidden). Add this footnote by hand in Word "
+                  "if needed."),
     "SKIPPED": "Already has a footnote from an earlier run - nothing to do.",
 }
 

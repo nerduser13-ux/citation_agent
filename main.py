@@ -13,6 +13,7 @@ Run:
     python main.py                          # first .docx in ./input
     python main.py --input thesis.docx
     python main.py --input thesis.docx --output out.docx --keep-marker
+    python main.py --separator ","          # [1,2] -> footnotes 1,2 (default: 1 2)
     python main.py --backend xml            # default; --backend com is
                                             # experimental, Windows-only
 
@@ -49,6 +50,10 @@ def _parse_args(argv):
                    help="Footnote backend (default: xml / OOXML)")
     p.add_argument("--keep-marker", action="store_true",
                    help="Keep the [n] marker text and insert the footnote after it")
+    p.add_argument("--separator", default=" ", metavar="TEXT",
+                   help=("Text between footnotes placed side by side, e.g. for "
+                         "[1,2] or [1], [2] (default: a space; \",\" for a comma, "
+                         "\"\" for none)"))
     p.add_argument("--overwrite", action="store_true",
                    help="Overwrite output if it already exists")
     p.add_argument("--input-dir", default="input")
@@ -56,21 +61,33 @@ def _parse_args(argv):
     return p.parse_args(argv)
 
 
-def _current_section(paragraphs, idx):
-    for j in range(idx, -1, -1):
-        if is_heading(paragraphs[j]):
-            return (paragraphs[j].text or "").strip()[:60] or "(unnamed heading)"
-    return "(document start)"
+def _section_names(paragraphs):
+    """For every paragraph, the nearest heading at or before it - one pass
+    (looking backwards per citation was slow in long documents)."""
+    names, current = [], "(document start)"
+    for p in paragraphs:
+        if is_heading(p):
+            current = (p.text or "").strip()[:60] or "(unnamed heading)"
+        names.append(current)
+    return names
 
 
 def _build_report_rows(citations, paragraphs, locations, ref_map):
     rows = []
+    sections = _section_names(paragraphs) if citations else []
     for c in citations:
         where = locations[c.para_index] if c.para_index < len(locations) else "?"
         loc = (f"para {c.para_index + 1} ({where}); "
-               f"section: {_current_section(paragraphs, c.para_index)}")
+               f"section: {sections[c.para_index]}")
         if c.status == "SUCCESS":
-            base_note = "Range expanded" if c.is_range else "Inline citation"
+            if c.is_range:
+                base_note = "Range expanded"
+            elif len(c.numbers) > 1:
+                base_note = "Several references in one citation"
+            else:
+                base_note = "Inline citation"
+            if c.joined:
+                base_note += "; placed right after the previous footnote(s)"
             for num in c.numbers:
                 entry = ref_map.get(num, {})
                 rows.append((num, loc, c.marker_text,
@@ -166,7 +183,8 @@ def run(config):
         # SaveAs-es to the output path; the input file is never written.
         try:
             process_document_com(str(inp), citations, ref_map,
-                                 config.replace_marker, str(out_path))
+                                 config.replace_marker, str(out_path),
+                                 separator=config.footnote_separator)
         except (RuntimeError, ImportError) as e:
             print(f"ERROR: COM backend unavailable: {e}")
             return 2
@@ -186,7 +204,8 @@ def run(config):
             by_para[c.para_index].append(c)
         for idx, cites in by_para.items():
             process_paragraph(edit_paragraphs[idx]._p, cites, backend,
-                              config.replace_marker, ref_map)
+                              config.replace_marker, ref_map,
+                              separator=config.footnote_separator)
         new_footnotes = dict(backend.new_footnotes)
         backend.save()
         edit_doc.save(str(out_path))
@@ -202,7 +221,8 @@ def run(config):
         in_path=str(inp), out_path=str(out_path), in_hash=in_hash,
         ref_map=ref_map, citations=citations, replace_marker=config.replace_marker,
         existing=existing, input_raw_texts=raw_texts,
-        new_footnotes=new_footnotes, parser_warnings=warnings))
+        new_footnotes=new_footnotes, parser_warnings=warnings,
+        separator=config.footnote_separator))
     for w in val["failures"]:
         print(f"VALIDATION FAILURE: {w}")
 
@@ -266,6 +286,7 @@ def main(argv=None):
     config.output_path = args.output
     config.backend = args.backend
     config.replace_marker = not args.keep_marker
+    config.footnote_separator = args.separator
     config.overwrite_output = args.overwrite
     config.input_dir = Path(args.input_dir)
     config.output_dir = Path(args.output_dir)

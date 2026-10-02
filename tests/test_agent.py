@@ -420,6 +420,23 @@ def test_add_footnotes_creates_copy_and_keeps_original(box):
         "citation_review_report.csv"]
 
 
+def test_add_footnotes_puts_grouped_citations_side_by_side(box):
+    from docx import Document as _Document
+    make_doc(box.input_dir / "Group.docx", ["Studies [1,2] and [1], [3]."], REFS)
+    res = box.call("add_footnotes", {"name": "Group"})
+    assert res["footnotes_added"] == 4 and res["validation"] == "PASS"
+    assert res["problems"] == []
+    out = _Document(str(box.output_dir / res["output_file"]))
+    assert out.paragraphs[0].text == "Studies   and  ."     # refs + spaces between
+    res = box.call("add_footnotes", {"name": "Group", "separator": "comma"})
+    out = _Document(str(box.output_dir / res["output_file"]))
+    assert out.paragraphs[0].text == "Studies , and ,." and res["validation"] == "PASS"
+    assert "separator must be" in box.call(
+        "add_footnotes", {"name": "Group", "separator": ";"})["error"]
+    spec = next(t for t in box.TOOL_SPECS if t["name"] == "add_footnotes")
+    assert spec["parameters"]["properties"]["separator"]["enum"] == ["space", "comma", "none"]
+
+
 def test_problems_are_explained(box):
     make_doc(box.input_dir / "Broken.docx", ["A [1]. B [5]. C [2]."],
              ["1. Alpha A. First paper. 2021. https://example.com/one",

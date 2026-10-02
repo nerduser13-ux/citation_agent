@@ -24,6 +24,11 @@ class Config:
     #          immediately AFTER it (the [n] text survives).
     replace_marker: bool = True
 
+    # Text between footnote references that stand side by side - for [1,2],
+    # [1-3] or "[1], [2]" - formatted like the references (superscript):
+    # " " -> 1 2,  "," -> 1,2,  "" -> 12 (adjacent; reads like twelve).
+    footnote_separator: str = " "
+
     # If the resolved output file already exists, create a safe alternative
     # (e.g. document_with_footnotes_1.docx) unless this is True.
     overwrite_output: bool = False

@@ -23,6 +23,13 @@ Surgical-editing principles:
   * The footnote-reference run keeps the original run's character formatting,
     gains the FootnoteReference character style, and is explicitly marked
     superscript so Word renders the footnote reference correctly.
+  * Several references cited together ([1,2], [1-3], [1]-[3]) become footnote
+    references side by side, with a separator between them (a space by
+    default, formatted like the references) so that 1 and 2 never read as 12.
+    Citations separated only by spaces and a comma or semicolon ("[1], [2]",
+    "[1][2]") are joined the same way in replace mode: the separator text
+    between them is removed - also across Word's invisible run splits, but only
+    through plain text runs, never across words, links, fields or footnotes.
   * A marker that spans runs, or sits inside a hyperlink / a complex-field
     result (reference-manager citation) / a run containing a drawing / field /
     object / other non-text content, is NOT modified - it is reported
@@ -35,6 +42,8 @@ Surgical-editing principles:
 import copy
 import os
 from collections import defaultdict
+
+from citation_detector import JOIN_GAP_RE
 
 from lxml import etree
 
@@ -274,6 +283,18 @@ def make_ref_run(fid, rpr, ref_style_id):
     return run
 
 
+def make_separator_run(text, rpr, ref_style_id):
+    """Text placed between two footnote references (e.g. a space or comma),
+    formatted exactly like the references (superscript) so they read as one
+    group: 1 2 (or 1,2) instead of 12."""
+    new_rpr = copy.deepcopy(rpr) if rpr is not None else None
+    new_rpr = _set_superscript(_set_rstyle(new_rpr, ref_style_id))
+    run = OxmlElement("w:r")
+    run.append(new_rpr)
+    run.append(_make_t(text))
+    return run
+
+
 def add_footnote_def(root, fid, url, ref_style_id, text_style_id):
     """Append a genuine <w:footnote> definition containing exactly ``url``.
 
@@ -487,6 +508,32 @@ def _zero_width_anchors(run_elem):
     return anchors
 
 
+# Textless elements that may sit between two citations that are joined.
+_JOIN_TRANSPARENT = (qn("w:proofErr"), qn("w:bookmarkStart"), qn("w:bookmarkEnd"))
+
+
+def _joinable(prev, cit, full):
+    """May citation ``cit`` be placed side by side with ``prev`` (removing the
+    text between them)? Only if that text is spaces plus at most one comma or
+    semicolon, and everything between the two host runs is plain text runs
+    (or spell-check marks / bookmarks) - never a link, field, tab, footnote..."""
+    if not JOIN_GAP_RE.fullmatch(full[prev.end:cit.start]):
+        return False
+    node = prev.host
+    while node is not cit.host:
+        node = node.getnext()
+        if node is None:
+            return False
+        if node is cit.host:
+            break
+        if node.tag == qn("w:r"):
+            if not _run_is_simple(node):
+                return False
+        elif node.tag not in _JOIN_TRANSPARENT:
+            return False
+    return True
+
+
 def _is_ref_run(run_elem):
     """Return True when the run contains a footnoteReference."""
     return (
@@ -505,11 +552,14 @@ def process_paragraph(
     backend,
     replace_marker,
     ref_map,
+    separator=" ",
 ):
     """Insert footnotes for citations belonging to one paragraph.
 
-    Only the individual run containing a citation is replaced.
-    Everything else in the paragraph remains untouched.
+    Only the individual run containing a citation is replaced (plus, when
+    citations are joined, the plain text runs holding the ", " between them).
+    Everything else in the paragraph remains untouched. ``separator`` goes
+    between footnote references that stand side by side ("" = none).
     """
 
     runs = p_elem.findall(qn("w:r"))
@@ -647,7 +697,31 @@ def process_paragraph(
         ]
 
     # ------------------------------------------------------------------
-    # 3. Replace the citation-containing runs.
+    # 3. Join neighbours: "[1], [2]" -> footnotes 1 and 2 side by side.
+    #    Replace mode only (in keep-marker mode no text is removed). The
+    #    text between them is cut from every run it lies in.
+    # ------------------------------------------------------------------
+
+    cuts = defaultdict(list)            # run -> [(local_lo, local_hi)]
+
+    if replace_marker:
+        prev = None
+        for c in sorted((c for c in para_citations if c.start >= 0),
+                        key=lambda c: c.start):
+            ready = c.status == "pending" and c.host is not None and bool(c.fids)
+            if ready and prev is not None and _joinable(prev, c, full):
+                c.joined = True
+                c.join_from = prev.end
+                for ri in run_info:
+                    lo = max(prev.end, ri["start"])
+                    hi = min(c.start, ri["end"])
+                    if lo < hi:
+                        cuts[ri["elem"]].append(
+                            (lo - ri["start"], hi - ri["start"]))
+            prev = c if ready else None
+
+    # ------------------------------------------------------------------
+    # 4. Replace the citation-containing runs (and cut the joining text).
     # ------------------------------------------------------------------
 
     groups = defaultdict(list)
@@ -660,9 +734,12 @@ def process_paragraph(
         ):
             groups[c.host].append(c)
 
-    for run_elem, cites in groups.items():
+    targets = list(groups) + [r for r in cuts if r not in groups]
 
-        cites.sort(
+    for run_elem in targets:
+
+        cites = sorted(
+            groups.get(run_elem, []),
             key=lambda c: c.local_start
         )
 
@@ -671,6 +748,8 @@ def process_paragraph(
             cites,
             replace_marker,
             backend.style_ids[0],
+            separator,
+            sorted(cuts.get(run_elem, [])),
         )
 
         parent = run_elem.getparent()
@@ -694,16 +773,22 @@ def _build_run_replacement(
     cites,
     replace_marker,
     ref_style_id,
+    separator=" ",
+    cuts=(),
 ):
     """Build replacement elements for one citation-containing run.
 
     Replace mode:
 
-        [before] [footnote ref] [footnote ref] [after]
+        [before] [footnote ref] [sep] [footnote ref] [after]
 
     Keep-marker mode:
 
-        [before] [marker] [footnote ref] [footnote ref] [after]
+        [before] [marker] [footnote ref] [sep] [footnote ref] [after]
+
+    ``cuts`` are local text ranges to remove: the ", " between two joined
+    citations. A joined citation's references start with a separator, so
+    "[1], [2]" becomes [ref 1] [sep] [ref 2].
 
     Text runs preserve the original rPr.
 
@@ -744,21 +829,36 @@ def _build_run_replacement(
             [(off - lo, el) for off, el in take_anchors(lo, hi, include_hi)],
         )
 
+    def removed(lo, hi):
+        """Zero-width elements of removed text stay at the removal point."""
+        return [make_anchor_run(el, rpr) for _off, el in take_anchors(lo, hi)]
+
+    # Citations and cuts in text order (a cut comes before the marker it
+    # leads up to; the two never overlap).
+    ops = sorted(
+        [(lo, hi, None) for lo, hi in cuts]
+        + [(c.local_start, c.local_end, c) for c in cites],
+        key=lambda op: (op[0], op[2] is not None),
+    )
+
     new_elems = []
 
     pos = 0
 
-    for c in cites:
-
-        ls = c.local_start
-        le = c.local_end
+    for ls, le, c in ops:
 
         # --------------------------------------------------------------
-        # Text before citation.
+        # Text before the citation / cut.
         # --------------------------------------------------------------
 
         if ls > pos:
             new_elems.append(text_run(pos, ls))
+
+        if c is None:
+            # The ", " between two joined citations disappears.
+            new_elems.extend(removed(ls, le))
+            pos = le
+            continue
 
         # --------------------------------------------------------------
         # Keep [n] marker if requested (otherwise it disappears, and any
@@ -769,15 +869,17 @@ def _build_run_replacement(
             if le > ls:
                 new_elems.append(text_run(ls, le))
         else:
-            new_elems.extend(
-                make_anchor_run(el, rpr) for _off, el in take_anchors(ls, le)
-            )
+            new_elems.extend(removed(ls, le))
 
         # --------------------------------------------------------------
-        # Genuine Word footnote references.
+        # Genuine Word footnote references, side by side with separators.
         # --------------------------------------------------------------
 
-        for _num, fid in c.fids:
+        for k, (_num, fid) in enumerate(c.fids):
+            if separator and (k > 0 or c.joined):
+                new_elems.append(
+                    make_separator_run(separator, rpr, ref_style_id)
+                )
             new_elems.append(
                 make_ref_run(
                     fid,
@@ -815,6 +917,7 @@ def process_document_com(
     ref_map,
     replace_marker,
     out_path,
+    separator=" ",
 ):
     """Use Microsoft Word COM automation to insert footnotes.
 
@@ -836,6 +939,11 @@ def process_document_com(
     for, so the search cursor stays aligned with the detector's sequence and a
     later identical marker is never matched to an earlier, unsafe occurrence.
     Citations inside hyperlinks (no position) are not searched for.
+
+    Footnotes of one citation ([1,2], [1-3]) are separated by ``separator``
+    (made superscript); in replace mode a citation that follows the previous
+    one with only spaces and a comma/semicolon between ("[1], [2]") is joined
+    to it, like the XML backend does.
     """
 
     if os.name != "nt":
@@ -859,6 +967,7 @@ def process_document_com(
 
         try:
             last_pos = 0
+            prev_done = None        # previous positioned citation, if inserted here
 
             positioned = sorted(
                 (c for c in citations if c.start >= 0),
@@ -895,11 +1004,13 @@ def process_document_com(
                             "Marker not found by Word COM; "
                             "left unchanged"
                         )
+                    prev_done = None
                     continue
 
                 # ``rng`` now spans exactly the matched marker text.
                 if c.status != "pending":
                     last_pos = rng.End      # unsafe marker: step over it
+                    prev_done = None
                     continue
 
                 # Validate every number BEFORE touching the document so a
@@ -921,18 +1032,34 @@ def process_document_com(
                         )
                     )
                     last_pos = rng.End
+                    prev_done = None
                     continue
+
+                # "[1], [2]": join to the previous citation's footnotes when
+                # only spaces and a comma/semicolon separate them.
+                joined = (
+                    replace_marker
+                    and prev_done is not None
+                    and prev_done.para_index == c.para_index
+                    and bool(JOIN_GAP_RE.fullmatch(
+                        doc.Range(last_pos, rng.Start).Text or ""))
+                )
 
                 # Remove the marker first (replace mode), then insert every
                 # footnote at a collapsed range, each one AFTER the previous
                 # reference mark, so [4]-[6] yields refs 4, 5, 6 in order.
                 if replace_marker:
-                    pos = rng.Start
-                    rng.Delete()
+                    pos = last_pos if joined else rng.Start
+                    doc.Range(pos, rng.End).Delete()
                 else:
                     pos = rng.End
 
-                for num in c.numbers:
+                for k, num in enumerate(c.numbers):
+                    if separator and (k > 0 or joined):
+                        sep_rng = doc.Range(pos, pos)
+                        sep_rng.InsertAfter(separator)
+                        sep_rng.Font.Superscript = True
+                        pos = sep_rng.End
                     fn = doc.Footnotes.Add(
                         Range=doc.Range(pos, pos),
                         Text=ref_map[num]["url"],
@@ -943,6 +1070,9 @@ def process_document_com(
 
                 c.status = "SUCCESS"
                 c.note = "COM footnote inserted"
+                c.joined = joined
+                c.join_from = prev_done.end if joined else -1
+                prev_done = c
 
             doc.SaveAs(
                 os.path.abspath(out_path)

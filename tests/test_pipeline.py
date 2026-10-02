@@ -879,44 +879,115 @@ def _run_from_spec(spec):
     return r
 
 
-def _tokens(p_elem):
-    """Linearised paragraph: characters, '<PB>' page-break hints, '<FN>'
-    footnote references - in document order."""
+URL_NUM = {r.split()[-1]: int(r.split(".")[0]) for r in REFS}   # url -> ref number
+
+
+def _stream(p_elem, fn_url):
+    """Linearised paragraph: characters, '|' for a page-break hint and '{n}'
+    for a footnote reference whose footnote holds reference n's URL."""
     out = []
     for el in p_elem.iter(qn("w:t"), qn("w:lastRenderedPageBreak"),
                           qn("w:footnoteReference")):
         if el.tag == qn("w:t"):
             out.extend(el.text or "")
         elif el.tag == qn("w:lastRenderedPageBreak"):
-            out.append("<PB>")
+            out.append("|")
         else:
-            out.append("<FN>")
+            out.append("{%d}" % URL_NUM[fn_url[el.get(qn("w:id"))]])
     return out
 
 
-def _expected_tokens(spec, replace):
-    """Oracle: the input stream with every marker followed by its footnote
-    references (keep mode) or replaced by them (replace mode). A page-break
-    hint strictly inside a replaced marker stays where the marker was, i.e.
-    immediately before the footnote references."""
-    plain = spec.replace("|", "")
-    spans = {}
-    for m in re.finditer(r"\[(\d+)\](?:\s*[-\u2013\u2014]\s*\[(\d+)\])?", plain):
-        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
-        spans[m.start()] = (m.end(), b - a + 1)
-    out, deferred, cur, i = [], [], None, 0
-    for ch in spec:
-        if ch == "|":
-            (deferred if (replace and cur) else out).append("<PB>")
+def _shown(path):
+    """Every paragraph of an output file as a string: 'studies {1} {2}.'"""
+    doc, _z, ft = load(path)
+    fn_url = {f.get(qn("w:id")): fn_text(f) for f in regular(ft)}
+    return ["".join(_stream(p._p, fn_url)) for p, _w in _iter(doc)]
+
+
+_ORACLE_MARK = re.compile(
+    r"\[ *\d+(?: *[-\u2013] *\d+)?(?: *[,;] *\d+(?: *[-\u2013] *\d+)?)* *\]")
+
+
+def _oracle(runs, replace=True, sep=" ", valid=(1, 2, 3, 4), blocked=()):
+    """Independent model of the expected output of one paragraph made of
+    plain runs (strings; '|' = page-break hint), as a ``_stream`` list.
+    ``blocked``: indices k where something that is not plain text (a tab)
+    sits between run k-1 and run k.
+
+    Rules: a marker is processed if it lies inside one run, is not a
+    reversed range and every number has a URL. Its footnote references stand
+    side by side with ``sep`` between them. In replace mode the marker
+    disappears, and a processed citation that follows a processed citation
+    with only spaces and one comma/semicolon between (and nothing blocking)
+    is joined to it: that text disappears too and ``sep`` goes between the
+    two groups. A hint inside removed text stays where it was, i.e. just
+    before the references that replace it."""
+    text, spans, hints = "", [], []
+    for spec in runs:
+        start = len(text)
+        for i, piece in enumerate(spec.split("|")):
+            if i:
+                hints.append(len(text))
+            text += piece
+        spans.append((start, len(text)))
+    toks = []
+    for m in _ORACLE_MARK.finditer(text):
+        nums, bad = [], False
+        for item in re.split("[,;]", m.group()[1:-1]):
+            ends = [int(x) for x in re.findall(r"\d+", item)]
+            bad = bad or (len(ends) == 2 and ends[0] > ends[1])
+            nums += list(range(ends[0], ends[-1] + 1)) if len(ends) == 2 else ends
+        toks.append((m.start(), m.end(), nums, bad,
+                     bool(re.fullmatch(r"\[ *\d+ *\]", m.group()))))
+    cites, i = [], 0
+    while i < len(toks):
+        s0, e0, nums, bad, single = toks[i]
+        if (single and i + 1 < len(toks) and toks[i + 1][4]
+                and re.fullmatch(r"\s*[-\u2013]\s*", text[e0:toks[i + 1][0]])):
+            a, b = nums[0], toks[i + 1][2][0]
+            cites.append({"start": s0, "end": toks[i + 1][1],
+                          "nums": list(range(a, b + 1)), "bad": a > b})
+            i += 2
             continue
-        if cur is None and i in spans:
-            cur = spans[i]
-        if not (replace and cur):
-            out.append(ch)
+        cites.append({"start": s0, "end": e0, "nums": nums, "bad": bad})
         i += 1
-        if cur and i == cur[0]:
-            out.extend(deferred + ["<FN>"] * cur[1])
-            deferred, cur = [], None
+    prev = None
+    for c in cites:
+        c["host"] = next((k for k, (a, b) in enumerate(spans)
+                          if a <= c["start"] and c["end"] <= b), None)
+        c["ok"] = (not c["bad"] and c["host"] is not None
+                   and all(n in valid for n in c["nums"]))
+        c["joined"] = bool(
+            replace and c["ok"] and prev is not None
+            and re.fullmatch(r" *[,;]? *", text[prev["end"]:c["start"]])
+            and not any(prev["host"] < k <= c["host"] for k in blocked))
+        c["from"] = prev["end"] if c["joined"] else c["start"]
+        prev = c if c["ok"] else None
+    removed = {}                       # offset -> end of the removal it is in
+    refs_at = {}
+    for c in cites:
+        if not c["ok"]:
+            continue
+        refs = []
+        for k, n in enumerate(c["nums"]):
+            if sep and (k or c["joined"]):
+                refs.extend(sep)
+            refs.append("{%d}" % n)
+        refs_at[c["end"]] = refs
+        if replace:
+            for j in range(c["from"], c["end"]):
+                removed[j] = c["end"]
+    out, deferred = [], {}
+    for o in range(len(text) + 1):
+        if o in refs_at:
+            out.extend(deferred.pop(o, []) + refs_at[o])
+        for _ in range(hints.count(o)):
+            if o in removed:
+                deferred.setdefault(removed[o], []).append("|")
+            else:
+                out.append("|")
+        if o < len(text) and o not in removed:
+            out.append(text[o])
     return out
 
 
@@ -929,6 +1000,8 @@ PAGE_BREAK_SPECS = [
     "head [1]| tail",         # hint directly after the marker
     "|a [1]|b| [2] c|",       # several hints and citations in one run
     "x [1]-|[3] y",           # hint inside a range marker
+    "x [1,|2] y",             # hint inside a list marker
+    "x [1],| [2]| y",         # hints in the text joining two citations
 ]
 
 
@@ -949,11 +1022,10 @@ def test_last_rendered_page_break_runs_processed(tmp_path, keep):
     assert rc == 0  # includes the validator's structural-count check
     _rows, summary = read_csv(tmp_path)
     assert summary["Ambiguous_citations"] == "0"
-    assert summary["Footnotes_inserted"] == "11"   # 6x1 + 2 + range 1..3
-    out_doc, _z, _ft = load(output_path(tmp_path))
-    out_paras = [p for p, _w in _iter(out_doc)][:len(PAGE_BREAK_SPECS)]
-    for spec, p in zip(PAGE_BREAK_SPECS, out_paras):
-        assert _tokens(p._p) == _expected_tokens(spec, replace=not keep), spec
+    assert summary["Footnotes_inserted"] == "15"   # 6x1 + 2 + 3 (range) + 2 + 2
+    shown = _shown(output_path(tmp_path))
+    for spec, line in zip(PAGE_BREAK_SPECS, shown):
+        assert line == "".join(_oracle([spec], replace=not keep)), spec
 
 
 def test_citation_in_content_control(tmp_path):
@@ -1136,3 +1208,371 @@ def test_superscript_inserted_in_schema_order(tmp_path):
     ref = next(doc2.element.body.iter(qn("w:footnoteReference")))
     names = [etree.QName(c).localname for c in ref.getparent().find(qn("w:rPr"))]
     assert names == ["rStyle", "b", "vertAlign", "lang"]
+
+
+# --------------------------------------------------------------------------
+# Several references cited together: [1,2], [1-3], "[1], [2]" -> footnotes
+# side by side
+# --------------------------------------------------------------------------
+def _paragraphs_doc(path, paragraphs):
+    """One paragraph per item; an item is a string or a list of run specs
+    ('|' = page-break hint), "<tab>" (a tab run), "<bm>" (a bookmark) or
+    "<link>" (a hyperlink whose text is "link")."""
+    doc = Document()
+    for n, item in enumerate(paragraphs):
+        p = doc.add_paragraph()
+        for spec in ([item] if isinstance(item, str) else item):
+            if spec == "<tab>":
+                r = OxmlElement("w:r")
+                r.append(OxmlElement("w:tab"))
+                p._p.append(r)
+            elif spec == "<bm>":
+                add_bookmark(p, bid=str(100 + n), name=f"bm{n}")
+            elif spec == "<link>":
+                add_hyperlink(p, "https://example.com/elsewhere", "link")
+            else:
+                p._p.append(_run_from_spec(spec))
+    doc.add_heading("References", level=1)
+    for r in REFS:
+        doc.add_paragraph(r)
+    doc.save(str(path))
+    return Path(path)
+
+
+GROUP_CASES = [
+    # the user's sentences
+    ("roundabouts ... published studies [1,2].", "roundabouts ... published studies {1} {2}."),
+    ("behavior of drivers [3,4].", "behavior of drivers {3} {4}."),
+    # several numbers in one bracket
+    ("A [1, 2] B", "A {1} {2} B"),
+    ("A [1;3] B", "A {1} {3} B"),
+    ("A [ 2 , 4 ] B", "A {2} {4} B"),
+    ("A [1-3] B", "A {1} {2} {3} B"),
+    ("A [1\u20133] B", "A {1} {2} {3} B"),
+    ("A [1, 3-4] B", "A {1} {3} {4} B"),
+    ("A [1]-[3] B", "A {1} {2} {3} B"),
+    # separate brackets that belong together
+    ("A [1], [2] B", "A {1} {2} B"),
+    ("A [1],[2] B", "A {1} {2} B"),
+    ("A [1][2] B", "A {1} {2} B"),
+    ("A [1] [2] B", "A {1} {2} B"),
+    ("A [1]; [2] B", "A {1} {2} B"),
+    ("A [1,2], [3] B", "A {1} {2} {3} B"),
+    ("A [1]-[3], [4] B", "A {1} {2} {3} {4} B"),
+    # words and other text are never removed
+    ("A [1] and [2] B", "A {1} and {2} B"),
+    ("A [1], [2], and [3] B", "A {1} {2}, and {3} B"),
+    ("A [1],, [2] B", "A {1},, {2} B"),
+    # problems: nothing partial, nothing guessed
+    ("A [1,9] B", "A [1,9] B"),                 # 9 is not in the list
+    ("A [1], [9] B", "A {1}, [9] B"),           # [1] on its own, [9] kept
+    ("A [9], [1] B", "A [9], {1} B"),
+    ("A [3-1] B", "A [3-1] B"),                 # reversed range
+    ("A [1-400] B", "A [1-400] B"),             # not a citation
+    ("A [1, p. 4] B", "A [1, p. 4] B"),         # not a citation either
+]
+
+
+def test_citations_with_several_references(tmp_path):
+    src = _paragraphs_doc(tmp_path / "t.docx", [given for given, _ in GROUP_CASES])
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0                                # validation passed
+    shown = _shown(output_path(tmp_path))
+    for (given, wanted), line in zip(GROUP_CASES, shown):
+        assert line == wanted, given
+    rows, summary = read_csv(tmp_path)
+    assert summary["Unresolved_citations"] == "3"   # [1,9] and both [9]
+    statuses = {(r[2], r[6]) for r in rows[1:] if len(r) > 6}
+    assert ("[1,9]", "ERROR") in statuses and ("[3-1]", "AMBIGUOUS") in statuses
+    assert ("[1-400]", "AMBIGUOUS") in statuses
+
+
+def test_keep_marker_mode_with_several_references(tmp_path):
+    src = _paragraphs_doc(tmp_path / "t.docx", [
+        "studies [1,2].", "A [1], [2] B", "A [1-3] B"])
+    rc, _ = run_tool(src, tmp_path, "--keep-marker")
+    assert rc == 0
+    assert _shown(output_path(tmp_path))[:3] == [
+        "studies [1,2]{1} {2}.", "A [1]{1}, [2]{2} B", "A [1-3]{1} {2} {3} B"]
+    # a second run finds the existing footnotes and adds nothing
+    rc2, out2 = run_tool(output_path(tmp_path), tmp_path / "r2", "--keep-marker")
+    assert rc2 == 0
+    _rows, summary = read_csv(tmp_path / "r2")
+    assert summary["Footnotes_inserted"] == "0"
+    assert summary["Previously_processed"] == "4"
+
+
+@pytest.mark.parametrize("sep, wanted", [
+    (",", ["studies {1},{2}.", "A {1},{2} B"]),
+    ("", ["studies {1}{2}.", "A {1}{2} B"]),
+])
+def test_separator_option(tmp_path, sep, wanted):
+    src = _paragraphs_doc(tmp_path / "t.docx", ["studies [1,2].", "A [1], [2] B"])
+    rc, _ = run_tool(src, tmp_path, "--separator", sep)
+    assert rc == 0
+    assert _shown(output_path(tmp_path))[:2] == wanted
+
+
+def test_separator_is_formatted_like_the_footnote_references(tmp_path):
+    src = make_doc(tmp_path / "t.docx", [["Plain ", ("bold claim [1,2]", True), "."]])
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    doc, _z, _ft = load(output_path(tmp_path))
+    ref = next(doc.element.body.iter(qn("w:footnoteReference"))).getparent()
+    sep = ref.getnext()
+    assert "".join(t.text for t in sep.iter(qn("w:t"))) == " "
+    names = [etree.QName(c).localname for c in sep.find(qn("w:rPr"))]
+    assert names == [etree.QName(c).localname for c in ref.find(qn("w:rPr"))]
+    assert names == ["rStyle", "b", "vertAlign"]   # bold kept, superscript added
+    assert sep.getnext().find(qn("w:footnoteReference")) is not None
+
+
+def test_joining_across_invisible_run_splits(tmp_path):
+    # Word splits text into runs for editing history, spell checking, ...
+    # "[1], [2]" can be several runs; the ", " between may be its own run.
+    src = _paragraphs_doc(tmp_path / "t.docx", [
+        ["A [1]", ", ", "[2] B"],
+        ["A [1],", " [2] B"],
+        ["A [1]", ",|", " [2] B"],        # page-break hint in the removed text
+        ["A [1]", "<bm>", ", [2] B"],     # a bookmark between is fine
+        ["A [1]", "<tab>", ", [2] B"],    # a tab is real content: not joined
+        ["A [1]", "<link>", ", [2] B"],   # so is a link (its text is not in the
+                                          # run text the markers are found in)
+        ["A [1", "], [2] B"],             # [1] split by formatting: left alone
+    ])
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0                         # incl. structural checks (bookmark, hint)
+    assert _shown(output_path(tmp_path))[:7] == [
+        "A {1} {2} B", "A {1} {2} B", "A {1}| {2} B", "A {1} {2} B",
+        "A {1}, {2} B", "A {1}link, {2} B", "A [1], {2} B"]
+
+
+def test_never_joined_across_an_existing_footnote(tmp_path):
+    doc = Document()
+    p = doc.add_paragraph()
+    p.add_run("A [1]")
+    add_preexisting_footnote(doc, p, "My own note.")
+    p.add_run(", [2] B")
+    doc.add_heading("References", level=1)
+    for r in REFS:
+        doc.add_paragraph(r)
+    src = tmp_path / "t.docx"
+    doc.save(str(src))
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 0
+    out_doc, _z, ft = load(output_path(tmp_path))
+    assert raw_text_of(next(iter_paragraphs(out_doc))._p) == "A ,  B"   # ", " kept
+    assert len(body_ref_ids(out_doc)) == 3 and len(regular(ft)) == 3
+
+
+def test_validator_catches_text_removed_between_citations(tmp_path, monkeypatch):
+    # The validator checks the output on its own: if joining ever removed
+    # more than spaces and a comma, validation must fail.
+    import re as _re
+    import word_footnotes
+    monkeypatch.setattr(word_footnotes, "JOIN_GAP_RE", _re.compile(r".*"))
+    src = _paragraphs_doc(tmp_path / "t.docx", ["A [1] and [2] B"])
+    rc, _ = run_tool(src, tmp_path)
+    assert rc == 1
+    assert _shown(output_path(tmp_path))[0] == "A {1} {2} B"   # "and" was lost
+    _rows, summary = read_csv(tmp_path)
+    assert summary["Status"] == "VALIDATION FAILED"
+
+
+def test_real_world_list_citations_are_reported(tmp_path):
+    rows_src = _paragraphs_doc(tmp_path / "t.docx", ["audit quality [3,4], or growth [2]."])
+    rc, _ = run_tool(rows_src, tmp_path)
+    assert rc == 0
+    rows, summary = read_csv(tmp_path)
+    assert summary["Citation_markers_detected"] == "2"
+    assert summary["Footnotes_inserted"] == "3"
+    listed = [r for r in rows[1:] if len(r) > 7 and r[2] == "[3,4]"]
+    assert [r[0] for r in listed] == ["3", "4"]
+    assert all(r[6] == "SUCCESS" and "Several references" in r[7] for r in listed)
+
+
+def _random_case(rng):
+    """A random paragraph full of citations, hints and run splits."""
+    def num():
+        return rng.choice([1, 2, 3, 4, 4, 9])
+    forms = [
+        lambda: f"[{num()}]",
+        lambda: f"[{num()},{num()}]",
+        lambda: f"[{num()}, {num()}]",
+        lambda: f"[{num()};{num()}]",
+        lambda: f"[{num()}-{num()}]",
+        lambda: f"[{num()} - {num()}]",
+        lambda: f"[{num()}]-[{num()}]",
+        lambda: f"[{num()}, {num()}-{num()}]",
+    ]
+    text = ""
+    for _ in range(rng.randint(1, 4)):
+        text += rng.choice(["Text ", "a b ", "word", "x, ", "y; ", "", " "])
+        group = [rng.choice(forms)() for _ in range(rng.randint(1, 3))]
+        gaps = [rng.choice([", ", ",", " ", "", "; ", " and ", ",, ", " ,  "])
+                for _ in group[1:]]
+        text += group[0] + "".join(g + m for g, m in zip(gaps, group[1:]))
+    text += rng.choice([".", " end.", ""])
+    for _ in range(rng.randint(0, 2)):                    # page-break hints
+        i = rng.randint(0, len(text))
+        text = text[:i] + "|" + text[i:]
+    cuts = sorted(rng.sample(range(len(text) + 1), rng.randint(0, 3)))
+    runs = [text[a:b] for a, b in zip([0] + cuts, cuts + [len(text)])]
+    between = [rng.choice([None, None, None, "<tab>", "<bm>"]) for _ in runs[1:]]
+    items, blocked = [runs[0]], set()
+    for k, (extra, spec) in enumerate(zip(between, runs[1:]), 1):
+        if extra:
+            items.append(extra)
+        if extra == "<tab>":
+            blocked.add(k)
+        items.append(spec)
+    return items, runs, blocked
+
+
+@pytest.mark.parametrize("keep, sep", [(False, " "), (False, ","), (True, " "), (False, "")],
+                         ids=["replace", "comma", "keep-marker", "no-separator"])
+def test_random_paragraphs_match_an_independent_model(tmp_path, keep, sep):
+    import random
+    rng = random.Random(20261002 + len(sep) + keep)
+    cases = [_random_case(rng) for _ in range(150)]
+    src = _paragraphs_doc(tmp_path / "t.docx", [items for items, _r, _b in cases])
+    args = ["--separator", sep] + (["--keep-marker"] if keep else [])
+    rc, _ = run_tool(src, tmp_path, *args)
+    assert rc == 0                                         # validator agrees
+    shown = _shown(output_path(tmp_path))
+    for (items, runs, blocked), line in zip(cases, shown):
+        assert line == "".join(_oracle(runs, replace=not keep, sep=sep,
+                                       blocked=blocked)), items
+
+
+# --------------------------------------------------------------------------
+# The Windows COM backend, driven through a small fake of Word's object model
+# (Word itself only exists on Windows; this checks the backend's logic)
+# --------------------------------------------------------------------------
+class _FakeFont:
+    def __init__(self, rng):
+        self._rng = rng
+
+    @property
+    def Superscript(self):
+        return all(c[1] for c in self._rng.doc.chars[self._rng.Start:self._rng.End])
+
+    @Superscript.setter
+    def Superscript(self, value):
+        for c in self._rng.doc.chars[self._rng.Start:self._rng.End]:
+            c[1] = value
+
+
+class _FakeFind:
+    def __init__(self, rng):
+        self._rng = rng
+        self.Text = ""
+
+    def ClearFormatting(self):
+        pass
+
+    def Execute(self):
+        i = self._rng.doc.text().find(self.Text, self._rng.Start, self._rng.End)
+        if i < 0:
+            return False
+        self._rng.Start, self._rng.End = i, i + len(self.Text)
+        return True
+
+
+class _FakeRange:
+    def __init__(self, doc, start, end):
+        self.doc, self.Start, self.End = doc, start, end
+        self.Find = _FakeFind(self)
+        self.Font = _FakeFont(self)
+
+    @property
+    def Text(self):
+        return self.doc.text()[self.Start:self.End]
+
+    def Delete(self):
+        del self.doc.chars[self.Start:self.End]
+        self.End = self.Start
+
+    def InsertAfter(self, text):
+        self.doc.chars[self.End:self.End] = [[ch, False] for ch in text]
+        self.End += len(text)
+
+
+class _FakeDoc:
+    """Characters are [char, superscript]; a footnote reference is the
+    character ("FN", url) - shown as '\\x02' in Text, as Word does."""
+
+    def __init__(self, paragraphs):
+        self.chars = [[ch, False] for ch in "\r".join(paragraphs) + "\r"]
+        self.saved_as = None
+        self.Footnotes = self
+
+    def text(self):
+        return "".join("\x02" if isinstance(c[0], tuple) else c[0] for c in self.chars)
+
+    def Range(self, start, end):
+        return _FakeRange(self, start, end)
+
+    @property
+    def Content(self):
+        return _FakeRange(self, 0, len(self.chars))
+
+    def Add(self, Range, Text):                      # doc.Footnotes.Add
+        self.chars.insert(Range.Start, [("FN", Text), True])
+        import types
+        return types.SimpleNamespace(Reference=_FakeRange(self, Range.Start, Range.Start + 1))
+
+    def SaveAs(self, path):
+        self.saved_as = path
+
+    def Close(self, SaveChanges=False):
+        pass
+
+    def shown(self):
+        """'studies {1}^ ^{2}.' - '^' marks superscript characters."""
+        out = []
+        for ch, sup in self.chars:
+            if isinstance(ch, tuple):
+                out.append("{%d}" % URL_NUM[ch[1]])
+            else:
+                out.append(ch + ("^" if sup else ""))
+        return "".join(out).split("\r")
+
+
+def test_com_backend_logic_with_a_fake_word(tmp_path, monkeypatch):
+    import types
+    import word_footnotes
+    from citation_detector import CitationDetector
+    from document_reader import DocumentReader
+    from config import Config
+    paragraphs = ["studies [1,2].", "A [1], [2] B", "A [1] and [3-4] B",
+                  "A [1], [9] B", "A [2], [1] [3]"]
+    src = _paragraphs_doc(tmp_path / "t.docx", paragraphs)
+    paras = DocumentReader(src).all_paragraphs()
+    start = ReferenceParser(Config()).find_reference_section(paras, Config())[0]
+    ref_map, _w = ReferenceParser().parse_references(paras, start)
+    cites = CitationDetector().detect(paras, start)
+    fake = _FakeDoc([raw_text_of(p._p) for p in paras])
+    word = types.SimpleNamespace(Visible=True, Quit=lambda: None,
+                                 Documents=types.SimpleNamespace(Open=lambda path: fake))
+    client = types.ModuleType("win32com.client")
+    client.Dispatch = lambda name: word
+    pkg = types.ModuleType("win32com")
+    pkg.client = client
+    monkeypatch.setitem(sys.modules, "win32com", pkg)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(word_footnotes, "os", types.SimpleNamespace(
+        name="nt", path=word_footnotes.os.path))
+    word_footnotes.process_document_com(str(src), cites, ref_map, True,
+                                        str(tmp_path / "out.docx"), separator=" ")
+    assert fake.saved_as == str((tmp_path / "out.docx").resolve())
+    assert fake.shown()[:5] == [
+        "studies {1} ^{2}.",            # the separator is superscript like the refs
+        "A {1} ^{2} B",                 # ", " removed: joined
+        "A {1} and {3} ^{4} B",         # words stay
+        "A {1}, [9] B",                 # [9] has no reference: kept, not joined
+        "A {2} ^{1} ^{3}",
+    ]
+    by_text = {(c.para_index, c.marker_text): c for c in cites}
+    assert by_text[(1, "[2]")].joined and by_text[(1, "[2]")].join_from == 5
+    assert by_text[(3, "[9]")].status == "ERROR" and not by_text[(3, "[1]")].joined

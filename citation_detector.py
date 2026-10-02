@@ -4,7 +4,8 @@ Finds numbered citation markers in the document BODY only (the reference
 section itself is excluded). Supported marker syntax:
 
     [1]
-    [2]
+    [1,2]  [1, 2]  [1;2]   (several references in one bracket)
+    [1-3]  [1–3]  [1, 3-5] (ranges inside one bracket)
     [1] and [2]
     [1], [2], and [3]
     [1]-[3]      (hyphen)
@@ -12,7 +13,11 @@ section itself is excluded). Supported marker syntax:
     [1]—[3]      (em dash)
     [2] ... [2]  (repeated citations -> one Citation object per occurrence)
 
-Ranges expand correctly: [4]-[6] -> 4, 5, 6 (three footnote references).
+Ranges expand correctly: [4]-[6] and [4-6] -> 4, 5, 6 (three footnote
+references), [1, 3-5] -> 1, 3, 4, 5. A citation with several numbers gets its
+footnote references side by side, and citations separated only by spaces and
+a comma or semicolon ("[1], [2]", "[1][2]") are placed side by side as one
+group (see word_footnotes.process_paragraph and JOIN_GAP_RE).
 
 COORDINATE SYSTEM: offsets are measured over the paragraph's DIRECT ``<w:r>``
 run text only (``direct_run_text_of``). This matches the coordinate space of
@@ -25,7 +30,8 @@ field - how EndNote, Zotero and Mendeley Desktop store "[1]", and how
 cross-references work - are reported AMBIGUOUS: a footnote inserted there would
 be destroyed (or break the field) the next time the field is refreshed.
 Markers that span runs are resolved as AMBIGUOUS at processing time. Reversed
-ranges ([3]-[1]) are reported AMBIGUOUS rather than guessed.
+ranges ([3]-[1], [3-1]) and implausibly long ones are reported AMBIGUOUS
+rather than guessed.
 
 Statuses:
     pending    -> not yet processed (resolved by word_footnotes.process_paragraph)
@@ -46,6 +52,39 @@ STATUS_SUCCESS = "SUCCESS"
 STATUS_ERROR = "ERROR"
 STATUS_SKIPPED = "SKIPPED"
 STATUS_AMBIGUOUS = "AMBIGUOUS"
+
+# Spaces that may appear inside a marker or between two markers of one group
+# (ordinary, no-break, thin, ... - but no tabs or line breaks).
+_SPACES = "[ \u00a0\u2000-\u200a\u202f\u205f\u3000]*"
+_DASH = "[-\u2013\u2014]"
+_ITEM = rf"\d+(?:{_SPACES}{_DASH}{_SPACES}\d+)?"
+# [1]  [1,2]  [1, 2]  [1;2]  [1-3]  [1–3]  [1, 3-5]
+MARKER_RE = re.compile(rf"\[{_SPACES}{_ITEM}(?:{_SPACES}[,;]{_SPACES}{_ITEM})*{_SPACES}\]")
+# What may separate two citations that are placed side by side as one group:
+# spaces and at most one comma or semicolon ("[1], [2]", "[1]; [2]", "[1][2]").
+# Never words ("[1] and [2]" keeps its "and").
+JOIN_GAP_RE = re.compile(rf"{_SPACES}[,;]?{_SPACES}")
+MAX_RANGE = 100          # longer "ranges" are surely not citations
+
+
+def parse_marker(text):
+    """'[1, 3-5]' -> (numbers, is_range, problem): ([1, 3, 4, 5], True, '').
+    ``problem`` is a reason to leave the marker unchanged ('' if none)."""
+    numbers, is_range = [], False
+    for item in re.split("[,;]", text.strip()[1:-1]):
+        ends = [int(n) for n in re.findall(r"\d+", item)]
+        if len(ends) == 2:
+            a, b = ends
+            if a > b:
+                return [a], True, "Reversed range (start > end); left unchanged"
+            if b - a >= MAX_RANGE:
+                return [a], True, "Range too long to be a citation; left unchanged"
+            numbers.extend(range(a, b + 1))
+            is_range = True
+        else:
+            numbers.extend(ends)
+    return numbers, is_range, ""
+
 
 _W_R = qn("w:r")
 _W_T = qn("w:t")
@@ -97,17 +136,22 @@ class Citation:
     end: int                 # offset just past the marker
     numbers: list            # reference numbers this marker maps to
     is_range: bool           # True for [a]-[b] style ranges
-    marker_text: str         # exact matched text, e.g. "[1]" or "[4]-[6]"
+    marker_text: str         # exact matched text, e.g. "[1]", "[1,2]" or "[4]-[6]"
     status: str = STATUS_PENDING
     note: str = ""
     fids: list = field(default_factory=list)    # (number, footnote_id) pairs
+    # Set when processing: the text between the previous citation and this one
+    # (only spaces and a comma/semicolon) was removed so both citations'
+    # footnote references stand side by side. join_from = previous citation's end.
+    joined: bool = False
+    join_from: int = -1
     host = None              # run element containing the marker (set later)
     local_start: int = 0
     local_end: int = 0
 
 
 class CitationDetector:
-    TOKEN_RE = re.compile(r"\[\d+\]")
+    TOKEN_RE = MARKER_RE
     # Separator between two range tokens: optional whitespace, one dash
     # (hyphen, en dash or em dash), optional whitespace.
     RANGE_GAP_RE = re.compile(r"^\s*[-\u2013\u2014]\s*$")
@@ -122,28 +166,33 @@ class CitationDetector:
                 break
             t = direct_run_text_of(p._p)
             in_field, field_depth = field_result_spans(p._p, field_depth)
-            tokens = [
-                (m.start(), m.end(), int(m.group()[1:-1]))
-                for m in self.TOKEN_RE.finditer(t)
-            ]
+            tokens = [(m.start(), m.end()) + parse_marker(m.group())
+                      for m in self.TOKEN_RE.finditer(t)]
+
+            def single(tok):            # a plain [n], usable in "[a]-[b]"
+                return not tok[3] and not tok[4] and len(tok[2]) == 1
+
             para_cites = []
             i = 0
             while i < len(tokens):
-                s, e, a = tokens[i]
-                if i + 1 < len(tokens):
-                    s2, e2, b = tokens[i + 1]
-                    if self.RANGE_GAP_RE.match(t[e:s2]):
-                        if a <= b:
-                            para_cites.append(Citation(
-                                idx, s, e2, list(range(a, b + 1)), True, t[s:e2]))
-                        else:
-                            para_cites.append(Citation(
-                                idx, s, e2, [a], True, t[s:e2],
-                                status=STATUS_AMBIGUOUS,
-                                note="Reversed range (start > end); left unchanged"))
-                        i += 2
-                        continue
-                para_cites.append(Citation(idx, s, e, [a], False, t[s:e]))
+                s, e, nums, is_range, problem = tokens[i]
+                if (i + 1 < len(tokens) and single(tokens[i]) and single(tokens[i + 1])
+                        and self.RANGE_GAP_RE.match(t[e:tokens[i + 1][0]])):
+                    e2 = tokens[i + 1][1]
+                    a, b = nums[0], tokens[i + 1][2][0]
+                    if a > b:
+                        problem = "Reversed range (start > end); left unchanged"
+                    elif b - a >= MAX_RANGE:
+                        problem = "Range too long to be a citation; left unchanged"
+                    para_cites.append(Citation(
+                        idx, s, e2, [a] if problem else list(range(a, b + 1)), True,
+                        t[s:e2], status=STATUS_AMBIGUOUS if problem else STATUS_PENDING,
+                        note=problem))
+                    i += 2
+                    continue
+                para_cites.append(Citation(
+                    idx, s, e, nums, is_range, t[s:e],
+                    status=STATUS_AMBIGUOUS if problem else STATUS_PENDING, note=problem))
                 i += 1
             for c in para_cites:
                 if c.status == STATUS_PENDING and any(
@@ -158,8 +207,9 @@ class CitationDetector:
             for hl in p._p.iter(qn("w:hyperlink")):
                 hl_text = "".join(tt.text or "" for tt in hl.iter(qn("w:t")))
                 for m in self.TOKEN_RE.finditer(hl_text):
+                    nums, is_range, _problem = parse_marker(m.group())
                     citations.append(Citation(
-                        idx, -1, -1, [int(m.group()[1:-1])], False, m.group(),
+                        idx, -1, -1, nums, is_range, m.group(),
                         status=STATUS_AMBIGUOUS,
                         note="Citation inside hyperlink; left unchanged to preserve the link"))
         return citations

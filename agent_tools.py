@@ -136,6 +136,9 @@ _NAME_PARAM = {
 }
 
 # Plain-English meaning of the pipeline's statuses, returned with problems.
+# add_footnotes(separator=...) -> text between footnotes placed side by side
+SEPARATORS = {"space": " ", "comma": ",", "none": ""}
+
 STATUS_HELP = {
     "ERROR": ("Not changed: the reference number is missing from the reference "
               "list, or that reference has no link. Fix the reference list."),
@@ -222,9 +225,10 @@ class Toolbox:
                 "Create a NEW copy of the document in the output folder in "
                 "which every numbered citation gets a real Word footnote "
                 "containing the source link from the reference list. The "
-                "original file is never modified. Returns the new file name, "
-                "counts, the validation result and any citations that could "
-                "not be processed."),
+                "original file is never modified. Several references cited "
+                "together ([1,2], [1-3], or [1], [2]) get their footnotes side "
+                "by side. Returns the new file name, counts, the validation "
+                "result and any citations that could not be processed."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -235,6 +239,14 @@ class Toolbox:
                             "true = keep the [n] text and add the footnote "
                             "after it; false (default) = replace [n] with the "
                             "footnote number."),
+                    },
+                    "separator": {
+                        "type": "string",
+                        "enum": list(SEPARATORS),
+                        "description": (
+                            "What goes between footnotes placed side by side: "
+                            "space (default, footnotes 1 2), comma (1,2) or "
+                            "none (12)."),
                     },
                 },
                 "required": ["name"],
@@ -318,13 +330,14 @@ class Toolbox:
         return info, ref_map, list(warnings)
 
     @staticmethod
-    def _run(path, output_dir, keep_marker):
+    def _run(path, output_dir, keep_marker, separator="space"):
         """Run the real pipeline (main.run) quietly and collect its results."""
         from main import run  # local import: keep module import side-effect free
         cfg = Config()
         cfg.input_path = str(path)
         cfg.output_dir = Path(output_dir)
         cfg.replace_marker = not keep_marker
+        cfg.footnote_separator = SEPARATORS[separator]
         log = io.StringIO()
         with contextlib.redirect_stdout(log):
             code = run(cfg)
@@ -404,9 +417,12 @@ class Toolbox:
             "reference_list_warnings": warnings,
         }
 
-    def add_footnotes(self, name, keep_marker=False):
+    def add_footnotes(self, name, keep_marker=False, separator="space"):
         path = self.resolve(name)
-        res = self._run(path, self.output_dir, keep_marker=bool(keep_marker))
+        if separator not in SEPARATORS:
+            raise ToolError(f"separator must be one of {list(SEPARATORS)}")
+        res = self._run(path, self.output_dir, keep_marker=bool(keep_marker),
+                        separator=separator)
         s = res["summary"]
         if res["code"] == 3:
             return {"document": path.name, "done": False, "message": (

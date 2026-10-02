@@ -10,7 +10,9 @@ prove that:
   * tables, hyperlinks, bookmarks, fields, drawings, content controls,
     section breaks and page layout are preserved (structural counts),
   * citation markers were removed exactly where processing succeeded
-    (and left alone everywhere else).
+    (and left alone everywhere else); between footnote references placed side
+    by side there is exactly the separator, and text removed to join two
+    citations ("[1], [2]") was nothing but spaces and a comma/semicolon.
 """
 import hashlib
 import zipfile
@@ -20,6 +22,7 @@ from typing import List
 
 from docx.oxml.ns import qn
 
+from citation_detector import JOIN_GAP_RE
 from document_reader import raw_text_of
 
 
@@ -103,6 +106,7 @@ class ValidationContext:
     input_raw_texts: list       # raw text per paragraph, input-side
     new_footnotes: dict         # {fid: url} allocated by this run
     parser_warnings: list = field(default_factory=list)
+    separator: str = " "        # text between footnote references side by side
 
 
 def validate_output(ctx: ValidationContext) -> dict:
@@ -204,17 +208,37 @@ def validate_output(ctx: ValidationContext) -> dict:
     for c in ctx.citations:
         cites_by_para[c.para_index].append(c)
     misfit = []
+    sep = ctx.separator
     for idx, (in_p, out_p) in enumerate(zip(in_p_elems, out_paras)):
-        expected = ctx.input_raw_texts[idx]
-        for c in sorted(cites_by_para.get(idx, []),
-                        key=lambda c: c.start, reverse=True):
-            if c.status != "SUCCESS" or c.start < 0 or not ctx.replace_marker:
+        original = ctx.input_raw_texts[idx]
+        spans = direct_to_raw_map(in_p)
+        edits = []                       # (raw_start, raw_end, replacement)
+        for c in cites_by_para.get(idx, []):
+            if c.status != "SUCCESS" or c.start < 0:
                 continue
-            for (d0, d1, r0, r1) in direct_to_raw_map(in_p):
-                if c.start >= d0 and c.end <= d1:
-                    rs, re = r0 + (c.start - d0), r0 + (c.end - d0)
-                    expected = expected[:rs] + expected[re:]
-                    break
+            span = next(((d0, r0) for d0, d1, r0, _r1 in spans
+                         if d0 <= c.start and c.end <= d1), None)
+            if span is None:
+                misfit.append(f"para {idx}: {c.marker_text!r} is not inside one run")
+                continue
+            rs = span[1] + (c.start - span[0])
+            rend = span[1] + (c.end - span[0])
+            between = sep * (len(c.numbers) - 1)     # footnote refs have no text
+            if not ctx.replace_marker:
+                edits.append((rend, rend, between))  # refs follow the kept marker
+            elif c.joined:
+                d0, r0 = next((d0, r0) for d0, d1, r0, _r1 in spans
+                              if d0 <= c.join_from <= d1)
+                gs = r0 + (c.join_from - d0)
+                if not JOIN_GAP_RE.fullmatch(original[gs:rs]):
+                    misfit.append(f"para {idx}: joined across text "
+                                  f"{original[gs:rs]!r}")
+                edits.append((gs, rend, sep + between))
+            else:
+                edits.append((rs, rend, between))
+        expected = original
+        for start, end, text in sorted(edits, reverse=True):
+            expected = expected[:start] + text + expected[end:]
         actual = raw_text_of(out_p)
         if actual != expected:
             misfit.append(f"para {idx}: {actual!r} != {expected!r}")

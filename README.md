@@ -2,7 +2,7 @@
 
 A document-preserving tool that inserts **real Microsoft Word footnotes**
 containing the explicit source URL for every numbered citation marker
-(`[1]`, `[1], [2]`, `[1]–[3]`, `[4]-[6]`, …) found in an existing `.docx`
+(`[1]`, `[1,2]`, `[1], [2]`, `[1-3]`, `[4]-[6]`, …) found in an existing `.docx`
 file. The References/Bibliography section of the document is used as the only
 authoritative number → source-URL mapping.
 
@@ -62,8 +62,8 @@ citation_agent/
 └── tests/
     ├── create_sample.py   # builds a realistic sample .docx (incl. a manual footnote)
     ├── validate_sample.py # deep checks of the sample output (OOXML level)
-    ├── test_pipeline.py   # pytest end-to-end suite (48 tests)
-    └── test_agent.py      # agent, AIs, tools, link checker, fully offline (105 tests)
+    ├── test_pipeline.py   # pytest end-to-end suite (62 tests)
+    └── test_agent.py      # agent, AIs, tools, link checker, fully offline (106 tests)
 ```
 
 ## Requirements
@@ -108,6 +108,7 @@ Options:
 | --- | --- |
 | `--backend xml\|com` | `xml` = OOXML manipulation (default, cross-platform, validated). `com` = Windows Microsoft Word COM automation (experimental, Windows-only). |
 | `--keep-marker` | Keep the `[n]` text and insert the footnote reference **after** it. Default: replace `[n]` with the footnote reference. |
+| `--separator TEXT` | What goes between footnotes placed side by side (for `[1,2]`, `[1-3]`, `[1], [2]`). Default a space (`studies ¹ ²`); `--separator ","` gives `¹,²`, `--separator ""` nothing (`¹²`, which reads like twelve). |
 | `--overwrite` | Allow overwriting an existing output file (default: create `<name>_with_footnotes_1.docx`, `_2`, …). |
 | `--input-dir` | Directory scanned for the default input (default `input`). |
 | `--output-dir` | Output directory (default `output`). |
@@ -345,10 +346,40 @@ replacement links.
 ## Citation syntax supported
 
 * `[1]` — single citation
-* `[1] and [2]`, `[1], [2], and [3]` — multiple distinct citations
-* `[2] … [2]` — repeated citation numbers (each occurrence gets a footnote)
+* `[1,2]`, `[1, 2]`, `[1;2]` — several references in one bracket
+* `[1-3]`, `[1–3]`, `[1, 3-5]` — ranges inside one bracket, expanded
+  (`[1, 3-5]` → references 1, 3, 4, 5 → four footnotes)
 * `[1]-[3]`, `[1]–[3]` (en dash), `[1]—[3]` (em dash) — ranges, expanded
   (`[4]-[6]` → references 4, 5, 6 → three footnotes)
+* `[1], [2]`, `[1]; [2]`, `[1] [2]`, `[1][2]` — separate brackets cited together
+* `[1] and [2]`, `[1], [2], and [3]` — multiple distinct citations
+* `[2] … [2]` — repeated citation numbers (each occurrence gets a footnote)
+
+**Several references cited together get their footnotes side by side**, with
+a space between them, formatted like the footnote numbers:
+
+```
+… according to published studies [1,2].   ->   … according to published studies ¹ ².
+… and behavior of drivers [3,5].           ->   … and behavior of drivers ³ ⁴.
+… crash rates fall [1], [2], and …         ->   … crash rates fall ⁵ ⁶, and …
+```
+
+* Word numbers footnotes **automatically, in reading order** (1, 2, 3, …),
+  so `[3,5]` becomes footnotes ³ and ⁴ if they are the third and fourth
+  footnotes; footnote ³ contains reference 3's link and footnote ⁴ reference
+  **5**'s link. The CSV report lists which reference each one holds.
+* In the default (replace) mode, separate brackets that are divided only by
+  spaces and one comma or semicolon (`[1], [2]`) are joined: that `, ` goes
+  and the footnotes stand side by side. Words are never removed:
+  `[1] and [2]` keeps its "and". Text is only joined through plain text
+  (also when Word has split it into several runs), never across a link,
+  field, tab or existing footnote. In `--keep-marker` mode nothing is
+  removed: `[1], [2]` becomes `[1]¹, [2]²` and `[1,2]` becomes `[1,2]¹ ²`.
+* The separator can be changed with `--separator` (see the options above).
+* A citation is all-or-nothing: if one of its numbers has no reference or no
+  link (`[1,9]`), the whole marker stays as it is and is reported as `ERROR`
+  (in `[1], [9]` only `[9]` stays). Reversed ranges (`[3-1]`) and implausibly
+  long ones (100+ numbers) are left unchanged as `AMBIGUOUS`.
 
 Detection operates on the actual OOXML structure:
 
@@ -533,18 +564,20 @@ replacing, inserts automatically numbered footnotes with
 `Footnotes.Add(Range=…, Text=url)` at a collapsed range (each one after the
 previous reference mark, so `[4]-[6]` stays in order), and `SaveAs`-es to the
 output path (input untouched). Markers classified unsafe by the detector are
-found and stepped over, never modified.
+found and stepped over, never modified. Footnotes cited together get the same
+superscript separator, and `[1], [2]` is joined, as in the XML backend.
 
-The **experimental** backend is Windows-only and was **not executed** in the
-Linux build/test environment (it fails loudly on other platforms); it follows
-the documented Word object model but has not been run against Word. The XML
-backend is the validated default and is what the test suite exercises.
+The **experimental** backend is Windows-only and has **not been run against
+Microsoft Word** (it fails loudly on other platforms); it follows the
+documented Word object model, and its logic is tested against a small fake of
+that object model. The XML backend is the validated default and is what the
+rest of the test suite exercises.
 
 ## Tests
 
 ```bash
-python -m pytest tests/ -v                 # 153 tests: 48 pipeline (OOXML-level)
-                                           #   + 105 agent / link checker (offline)
+python -m pytest tests/ -v                 # 168 tests: 62 pipeline (OOXML-level)
+                                           #   + 106 agent / link checker (offline)
 python tests/create_sample.py              # (re)generate input/sample.docx
                                            #   (or: create_sample.py OUT.docx)
 python main.py                             # process the sample
@@ -553,6 +586,14 @@ python tests/validate_sample.py            # deep checks of the sample output
 
 The pytest suite covers: simple `[1]`; multiple citations; repeated numbers;
 `[1]-[3]`, `[1]–[3]` and `[1]—[3]` ranges; reversed range (ambiguous);
+several references in one bracket (`[1,2]`, `[1, 3-4]`, `[1-3]`, ...) and
+joined brackets (`[1], [2]`, `[1][2]`, also across Word's run splits; never
+across words, links, tabs or existing footnotes) with the separator between
+footnotes, in both modes and with every `--separator`; a randomized
+cross-check of 600 generated paragraphs (lists, ranges, joins, run splits,
+page-break hints) against an independent model of the expected output; a
+validator check that text removed while joining can only be `, `-style
+separators; the COM backend's logic through a fake Word object model;
 citation in bold text; citation in a table (incl. nested tables); hyperlink
 preservation; citation **inside** a hyperlink (untouched); citation **split
 across runs** (untouched); fields/bookmarks preservation; missing reference
